@@ -30,13 +30,15 @@ func (q *Queue) Enqueue(ctx context.Context, fn func(context.Context)) {
 		return
 	}
 
-	q.wg.Go(func() {
+	q.wg.Add(1)
+	go func() {
+		defer q.wg.Done()
 		// Check context again before executing
 		if ctx.Err() != nil {
 			return
 		}
 		fn(ctx)
-	})
+	}()
 }
 
 // Wait waits for all active tasks to complete.

@@ -36,9 +36,11 @@ func (w *parallelWorkGroup) Queue(fn func()) {
 		panic("Queue called after RunAndWait returned")
 	}
 
-	w.wg.Go(func() {
+	w.wg.Add(1)
+	go func() {
+		defer w.wg.Done()
 		fn()
-	})
+	}()
 }
 
 func (w *parallelWorkGroup) RunAndWait() {

@@ -242,12 +242,20 @@ func resolveKeyName(k reflect.Value) (string, error) {
 	if k.Kind() == reflect.String {
 		return k.String(), nil
 	}
-	if tm, ok := reflect.TypeAssert[encoding.TextMarshaler](k); ok {
-		if k.Kind() == reflect.Pointer && k.IsNil() {
-			return "", nil
+	if k.CanInterface() {
+		if tm, ok := k.Interface().(encoding.TextMarshaler); ok {
+			if k.Kind() == reflect.Pointer && k.IsNil() {
+				return "", nil
+			}
+			buf, err := tm.MarshalText()
+			return string(buf), err
 		}
-		buf, err := tm.MarshalText()
-		return string(buf), err
+	}
+	if k.Kind() == reflect.Pointer && !k.IsNil() && k.Elem().CanInterface() {
+		if tm, ok := k.Elem().Interface().(encoding.TextMarshaler); ok {
+			buf, err := tm.MarshalText()
+			return string(buf), err
+		}
 	}
 	switch k.Kind() {
 	case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64:
