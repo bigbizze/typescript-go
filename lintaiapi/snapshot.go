@@ -522,7 +522,7 @@ func (e *extractor) collectFunction(node *ast.Node) *Function {
 	}
 
 	nameRange := e.location(file, meta.nameNode.Pos(), meta.nameNode.End())
-	baseKey := fmt.Sprintf("%s::function::%s::%s", nameRange.File, meta.kind, displayName)
+	baseKey := fmt.Sprintf("%s::%s::%s", nameRange.File, meta.kind, displayName)
 	semanticKey := withOrdinal(baseKey, nextOrdinal(e.functionCount, baseKey))
 	record := Function{
 		EntityID:      "function:" + semanticKey,
