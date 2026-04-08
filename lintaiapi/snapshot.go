@@ -38,25 +38,41 @@ type Module struct {
 }
 
 type Function struct {
-	EntityID      string
-	SemanticKey   string
-	Name          string
-	Kind          string
-	FilePath      string
-	ContainerName string
-	ContainsAwait bool
-	Range         SourceLocation
-	BodyStart     int
-	BodyEnd       int
+	EntityID           string
+	SemanticKey        string
+	Name               string
+	Kind               string
+	FilePath           string
+	ContainerName      string
+	ContainsAwait      bool
+	IsExported         bool
+	IsAsync            bool
+	ParameterCount     int
+	ReturnTypeText     string
+	ParameterTypeTexts []string
+	Range              SourceLocation
+	BodyStart          int
+	BodyEnd            int
+}
+
+type ImportedSymbol struct {
+	Name       string
+	Kind       string
+	IsTypeOnly bool
 }
 
 type ImportEdge struct {
-	EntityID    string
-	SemanticKey string
-	Specifier   string
-	FromPath    string
-	ToPath      string
-	Range       SourceLocation
+	EntityID           string
+	SemanticKey        string
+	Specifier          string
+	FromPath           string
+	ToPath             string
+	ImportedSymbols    []ImportedSymbol
+	HasDefaultImport   bool
+	HasNamespaceImport bool
+	HasNamedImports    bool
+	IsTypeOnly         bool
+	Range              SourceLocation
 }
 
 type CallEdge struct {
@@ -76,15 +92,26 @@ type TypeRef struct {
 	SemanticKey string
 	Name        string
 	FilePath    string
+	TargetPath  string
 	Range       SourceLocation
 }
 
+type PendingDtsCall struct {
+	DtsPath         string
+	TargetName      string
+	FromSemanticKey string
+	FromName        string
+	FromPath        string
+	Range           SourceLocation
+}
+
 type Snapshot struct {
-	Modules     []Module
-	Functions   []Function
-	ImportEdges []ImportEdge
-	CallEdges   []CallEdge
-	TypeRefs    []TypeRef
+	Modules         []Module
+	Functions       []Function
+	ImportEdges     []ImportEdge
+	CallEdges       []CallEdge
+	TypeRefs        []TypeRef
+	PendingDtsCalls []PendingDtsCall
 }
 
 type configGroup struct {
@@ -93,23 +120,25 @@ type configGroup struct {
 }
 
 type extractor struct {
-	workspaceRoot  string
-	program        *compiler.Program
-	checker        *checker.Checker
-	requestedFiles map[string]struct{}
-	primaryFiles   map[string]struct{}
-	filesByPath    map[string]*ast.SourceFile
-	functionNodes  map[*ast.Node]*Function
-	functionKeys   map[string]*Function
-	functionSyms   map[*ast.Symbol]*Function
-	functionCount  map[string]int
-	importCount    map[string]int
-	callCount      map[string]int
-	typeRefCount   map[string]int
-	functions      []Function
-	imports        []ImportEdge
-	calls          []CallEdge
-	typeRefs       []TypeRef
+	workspaceRoot   string
+	program         *compiler.Program
+	checker         *checker.Checker
+	requestedFiles  map[string]struct{}
+	primaryFiles    map[string]struct{}
+	filesByPath     map[string]*ast.SourceFile
+	functionNodes   map[*ast.Node]*Function
+	functionKeys    map[string]*Function
+	functionSyms    map[*ast.Symbol]*Function
+	functionCount   map[string]int
+	importCount     map[string]int
+	callCount       map[string]int
+	typeRefCount    map[string]int
+	functions       []Function
+	imports         []ImportEdge
+	calls           []CallEdge
+	typeRefs        []TypeRef
+	pendingDtsCalls []PendingDtsCall
+	debugCalls      bool
 }
 
 type functionMeta struct {
@@ -165,8 +194,48 @@ func BuildSnapshot(ctx context.Context, req BuildSnapshotRequest) (*Snapshot, er
 		}
 		mergeSnapshot(merged, partial)
 	}
+	resolveDtsCalls(merged)
 	sortSnapshot(merged)
 	return merged, nil
+}
+
+// resolveDtsCalls resolves unresolved calls where the target declaration is
+// in a .d.ts file but the source function exists in the snapshot under a
+// different path (dist/ → src/ mapping). This happens in monorepos where
+// packages consume each other's compiled output.
+func resolveDtsCalls(snap *Snapshot) {
+	// Build index of functions by (name, path)
+	type fnKey struct{ name, path string }
+	fnIndex := make(map[fnKey]int, len(snap.Functions))
+	for i, fn := range snap.Functions {
+		fnIndex[fnKey{fn.Name, fn.FilePath}] = i
+	}
+
+	// Process pending dts calls
+	for _, pending := range snap.PendingDtsCalls {
+		srcPath := mapDtsToSource(pending.DtsPath)
+		if srcPath == "" {
+			continue
+		}
+		idx, ok := fnIndex[fnKey{pending.TargetName, srcPath}]
+		if !ok {
+			continue
+		}
+		target := &snap.Functions[idx]
+		baseKey := fmt.Sprintf("%s::calls::%s", pending.FromSemanticKey, target.SemanticKey)
+		snap.CallEdges = append(snap.CallEdges, CallEdge{
+			EntityID:        "call:" + baseKey,
+			SemanticKey:     baseKey,
+			FromSemanticKey: pending.FromSemanticKey,
+			ToSemanticKey:   target.SemanticKey,
+			FromName:        pending.FromName,
+			ToName:          target.Name,
+			FromPath:        pending.FromPath,
+			ToPath:          target.FilePath,
+			Range:           pending.Range,
+		})
+	}
+	snap.PendingDtsCalls = nil
 }
 
 func buildSnapshotForGroup(ctx context.Context, workspaceRoot string, requestedFiles []string, group configGroup) (*Snapshot, []string, error) {
@@ -206,6 +275,7 @@ func buildSnapshotForGroup(ctx context.Context, workspaceRoot string, requestedF
 		importCount:    make(map[string]int),
 		callCount:      make(map[string]int),
 		typeRefCount:   make(map[string]int),
+		debugCalls:     os.Getenv("LINTAI_DEBUG_CALLS") == "1",
 	}
 	for _, file := range requestedFiles {
 		ex.requestedFiles[file] = struct{}{}
@@ -251,11 +321,12 @@ func buildSnapshotForGroup(ctx context.Context, workspaceRoot string, requestedF
 	}
 
 	partial := &Snapshot{
-		Modules:     modules,
-		Functions:   ex.functions,
-		ImportEdges: ex.imports,
-		CallEdges:   ex.calls,
-		TypeRefs:    ex.typeRefs,
+		Modules:         modules,
+		Functions:       ex.functions,
+		ImportEdges:     ex.imports,
+		CallEdges:       ex.calls,
+		TypeRefs:        ex.typeRefs,
+		PendingDtsCalls: ex.pendingDtsCalls,
 	}
 	sortSnapshot(partial)
 	return partial, missingPrimary, nil
@@ -367,6 +438,7 @@ func mergeSnapshot(into *Snapshot, partial *Snapshot) {
 	into.ImportEdges = mergeImportEdges(into.ImportEdges, partial.ImportEdges)
 	into.CallEdges = mergeCallEdges(into.CallEdges, partial.CallEdges)
 	into.TypeRefs = mergeTypeRefs(into.TypeRefs, partial.TypeRefs)
+	into.PendingDtsCalls = append(into.PendingDtsCalls, partial.PendingDtsCalls...)
 }
 
 func sortSnapshot(snapshot *Snapshot) {
@@ -525,16 +597,21 @@ func (e *extractor) collectFunction(node *ast.Node) *Function {
 	baseKey := fmt.Sprintf("%s::%s::%s", nameRange.File, meta.kind, displayName)
 	semanticKey := withOrdinal(baseKey, nextOrdinal(e.functionCount, baseKey))
 	record := Function{
-		EntityID:      "function:" + semanticKey,
-		SemanticKey:   semanticKey,
-		Name:          displayName,
-		Kind:          meta.kind,
-		FilePath:      nameRange.File,
-		ContainerName: containerName,
-		ContainsAwait: containsAwait(node),
-		Range:         nameRange,
-		BodyStart:     node.Body().Pos(),
-		BodyEnd:       node.Body().End(),
+		EntityID:           "function:" + semanticKey,
+		SemanticKey:        semanticKey,
+		Name:               displayName,
+		Kind:               meta.kind,
+		FilePath:           nameRange.File,
+		ContainerName:      containerName,
+		ContainsAwait:      containsAwait(node),
+		IsExported:         e.isExportedFunction(node, meta),
+		IsAsync:            ast.HasSyntacticModifier(node, ast.ModifierFlagsAsync),
+		ParameterCount:     len(node.Parameters()),
+		ReturnTypeText:     e.functionReturnTypeText(node),
+		ParameterTypeTexts: e.functionParameterTypeTexts(node),
+		Range:              nameRange,
+		BodyStart:          node.Body().Pos(),
+		BodyEnd:            node.Body().End(),
 	}
 	e.functions = append(e.functions, record)
 	stored := &e.functions[len(e.functions)-1]
@@ -584,19 +661,26 @@ func (e *extractor) collectImport(node *ast.Node) {
 	location := e.location(file, moduleSpecifier.Pos(), moduleSpecifier.End())
 	baseKey := fmt.Sprintf("%s::import::%s", fromPath, specifier)
 	semanticKey := withOrdinal(baseKey, nextOrdinal(e.importCount, baseKey))
+	importedSymbols, hasDefaultImport, hasNamespaceImport, hasNamedImports, isTypeOnly := extractImportedSymbols(node)
 	e.imports = append(e.imports, ImportEdge{
-		EntityID:    "import:" + semanticKey,
-		SemanticKey: semanticKey,
-		Specifier:   specifier,
-		FromPath:    fromPath,
-		ToPath:      toPath,
-		Range:       location,
+		EntityID:           "import:" + semanticKey,
+		SemanticKey:        semanticKey,
+		Specifier:          specifier,
+		FromPath:           fromPath,
+		ToPath:             toPath,
+		ImportedSymbols:    importedSymbols,
+		HasDefaultImport:   hasDefaultImport,
+		HasNamespaceImport: hasNamespaceImport,
+		HasNamedImports:    hasNamedImports,
+		IsTypeOnly:         isTypeOnly,
+		Range:              location,
 	})
 }
 
 func (e *extractor) collectCall(source *Function, node *ast.Node) {
 	target := e.resolveCallTarget(node)
 	if target == nil {
+		e.recordPendingDtsCall(source, node)
 		return
 	}
 	file := ast.GetSourceFileOfNode(node)
@@ -625,16 +709,34 @@ func (e *extractor) collectCall(source *Function, node *ast.Node) {
 
 func (e *extractor) resolveCallTarget(node *ast.Node) *Function {
 	if signature := e.checker.GetResolvedSignature(node); signature != nil {
-		if target := e.lookupFunction(signature.Declaration()); target != nil {
+		decl := signature.Declaration()
+		if target := e.lookupFunction(decl); target != nil {
 			return target
+		}
+		if decl != nil {
+			if sym := decl.Symbol(); sym != nil {
+				if target := e.lookupFunction(sym); target != nil {
+					return target
+				}
+			}
 		}
 	}
 	expression := node.Expression()
 	if expression == nil {
 		return nil
 	}
-	if target := e.lookupFunction(e.checker.GetResolvedSymbol(expression)); target != nil {
-		return target
+	if ast.IsIdentifier(expression) {
+		if sym := e.checker.GetResolvedSymbol(expression); sym != nil {
+			if target := e.lookupFunction(sym); target != nil {
+				return target
+			}
+		}
+		// Also try GetSymbolAtLocation which may resolve differently.
+		if sym := e.checker.GetSymbolAtLocation(expression); sym != nil {
+			if target := e.lookupFunction(sym); target != nil {
+				return target
+			}
+		}
 	}
 	if ast.IsPropertyAccessExpression(expression) {
 		if target := e.lookupFunction(e.checker.GetResolvedSymbol(expression.Name().AsNode())); target != nil {
@@ -645,6 +747,63 @@ func (e *extractor) resolveCallTarget(node *ast.Node) *Function {
 		return target
 	}
 	return nil
+}
+
+func (e *extractor) recordPendingDtsCall(source *Function, node *ast.Node) {
+	signature := e.checker.GetResolvedSignature(node)
+	if signature == nil {
+		return
+	}
+	decl := signature.Declaration()
+	if decl == nil {
+		return
+	}
+	sf := ast.GetSourceFileOfNode(decl)
+	if sf == nil {
+		return
+	}
+	fileName := normalizeSlash(sf.FileName())
+	if !strings.HasSuffix(fileName, ".d.ts") {
+		return
+	}
+	name := ""
+	if decl.Symbol() != nil {
+		name = decl.Symbol().Name
+	}
+	if name == "" {
+		return
+	}
+	relPath := e.relativePath(fileName)
+	if !strings.Contains(relPath, "/dist/") {
+		return
+	}
+	calleeNode := node.Expression()
+	if ast.IsPropertyAccessExpression(calleeNode) {
+		calleeNode = calleeNode.Name().AsNode()
+	}
+	callFile := ast.GetSourceFileOfNode(node)
+	if callFile == nil {
+		return
+	}
+	location := e.location(callFile, calleeNode.Pos(), calleeNode.End())
+	e.pendingDtsCalls = append(e.pendingDtsCalls, PendingDtsCall{
+		DtsPath:         relPath,
+		TargetName:      name,
+		FromSemanticKey: source.SemanticKey,
+		FromName:        source.Name,
+		FromPath:        source.FilePath,
+		Range:           location,
+	})
+}
+
+func mapDtsToSource(dtsPath string) string {
+	// packages/foo/dist/bar.d.ts → packages/foo/src/bar.ts
+	if !strings.Contains(dtsPath, "/dist/") {
+		return ""
+	}
+	srcPath := strings.Replace(dtsPath, "/dist/", "/src/", 1)
+	srcPath = strings.TrimSuffix(srcPath, ".d.ts") + ".ts"
+	return srcPath
 }
 
 func (e *extractor) lookupFunction(value any) *Function {
@@ -666,7 +825,14 @@ func (e *extractor) lookupFunction(value any) *Function {
 		if typed == nil {
 			return nil
 		}
-		for symbol := typed; symbol != nil; {
+		// Try the symbol as-is and then its fully-resolved alias.
+		candidates := []*ast.Symbol{typed}
+		if typed.Flags&ast.SymbolFlagsAlias != 0 {
+			if resolved := e.checker.SkipAlias(typed); resolved != nil && resolved != typed {
+				candidates = append(candidates, resolved)
+			}
+		}
+		for _, symbol := range candidates {
 			if record := e.functionSyms[symbol]; record != nil {
 				return record
 			}
@@ -686,10 +852,6 @@ func (e *extractor) lookupFunction(value any) *Function {
 					return record
 				}
 			}
-			if symbol.Flags&ast.SymbolFlagsAlias == 0 {
-				break
-			}
-			symbol = e.checker.GetImmediateAliasedSymbol(symbol)
 		}
 	}
 	return nil
@@ -719,8 +881,227 @@ func (e *extractor) collectTypeRef(nameNode *ast.Node, rangeNode *ast.Node) {
 		SemanticKey: semanticKey,
 		Name:        name,
 		FilePath:    location.File,
+		TargetPath:  e.resolveTypeTargetPath(nameNode),
 		Range:       location,
 	})
+}
+
+func (e *extractor) isExportedFunction(node *ast.Node, meta *functionMeta) bool {
+	if ast.GetCombinedModifierFlags(meta.namingSource)&ast.ModifierFlagsExport != 0 {
+		return true
+	}
+	for _, lookupNode := range meta.lookupNodes {
+		if lookupNode == nil {
+			continue
+		}
+		if symbol := lookupNode.Symbol(); e.isExportedSymbol(symbol) {
+			return true
+		}
+	}
+	return e.isExportedSymbol(node.Symbol())
+}
+
+func (e *extractor) isExportedSymbol(symbol *ast.Symbol) bool {
+	if symbol == nil {
+		return false
+	}
+	if symbol.ExportSymbol != nil {
+		return true
+	}
+	exportSymbol := e.checker.GetExportSymbolOfSymbol(symbol)
+	return exportSymbol != nil && exportSymbol != symbol
+}
+
+func (e *extractor) functionReturnTypeText(node *ast.Node) string {
+	signature := e.checker.GetSignatureFromDeclaration(node)
+	if signature == nil {
+		return ""
+	}
+	return e.renderTypeText(e.checker.GetReturnTypeOfSignature(signature), node)
+}
+
+func (e *extractor) functionParameterTypeTexts(node *ast.Node) []string {
+	parameters := node.Parameters()
+	texts := make([]string, 0, len(parameters))
+	for _, parameter := range parameters {
+		if parameter == nil {
+			texts = append(texts, "")
+			continue
+		}
+		texts = append(texts, e.renderTypeText(e.checker.GetTypeAtLocation(parameter.AsNode()), parameter.AsNode()))
+	}
+	return texts
+}
+
+func (e *extractor) renderTypeText(t *checker.Type, enclosing *ast.Node) string {
+	if t == nil {
+		return ""
+	}
+	return e.checker.TypeToStringEx(
+		t,
+		enclosing,
+		checker.TypeFormatFlagsNoTruncation|checker.TypeFormatFlagsUseAliasDefinedOutsideCurrentScope,
+	)
+}
+
+func extractImportedSymbols(node *ast.Node) ([]ImportedSymbol, bool, bool, bool, bool) {
+	if node == nil || !ast.IsImportDeclaration(node) {
+		return nil, false, false, false, false
+	}
+	decl := node.AsImportDeclaration()
+	if decl.ImportClause == nil {
+		return nil, false, false, false, false
+	}
+	clause := decl.ImportClause.AsImportClause()
+	if clause == nil {
+		return nil, false, false, false, false
+	}
+
+	symbols := make([]ImportedSymbol, 0, 4)
+	isTypeOnly := clause.IsTypeOnly()
+	hasDefaultImport := false
+	hasNamespaceImport := false
+	hasNamedImports := false
+
+	if name := clause.Name(); name != nil {
+		hasDefaultImport = true
+		symbols = append(symbols, ImportedSymbol{
+			Name:       name.Text(),
+			Kind:       "default",
+			IsTypeOnly: isTypeOnly,
+		})
+	}
+	if clause.NamedBindings == nil {
+		return symbols, hasDefaultImport, hasNamespaceImport, hasNamedImports, isTypeOnly
+	}
+
+	switch clause.NamedBindings.Kind {
+	case ast.KindNamespaceImport:
+		hasNamespaceImport = true
+		if name := clause.NamedBindings.Name(); name != nil {
+			symbols = append(symbols, ImportedSymbol{
+				Name:       name.Text(),
+				Kind:       "namespace",
+				IsTypeOnly: clause.NamedBindings.IsTypeOnly(),
+			})
+		}
+	case ast.KindNamedImports:
+		hasNamedImports = true
+		for _, specifier := range clause.NamedBindings.Elements() {
+			if specifier == nil || specifier.Name() == nil {
+				continue
+			}
+			symbols = append(symbols, ImportedSymbol{
+				Name:       specifier.Name().Text(),
+				Kind:       "named",
+				IsTypeOnly: specifier.IsTypeOnly() || isTypeOnly,
+			})
+		}
+	}
+	return symbols, hasDefaultImport, hasNamespaceImport, hasNamedImports, isTypeOnly
+}
+
+func (e *extractor) resolveTypeTargetPath(nameNode *ast.Node) string {
+	seen := map[*ast.Symbol]struct{}{}
+	queue := make([]*ast.Symbol, 0, 4)
+	enqueue := func(symbol *ast.Symbol) {
+		if symbol == nil {
+			return
+		}
+		if _, ok := seen[symbol]; ok {
+			return
+		}
+		seen[symbol] = struct{}{}
+		queue = append(queue, symbol)
+	}
+
+	e.enqueueTypeReferenceSymbols(nameNode, enqueue)
+	if typ := e.checker.GetTypeAtLocation(nameNode); typ != nil {
+		enqueue(typ.Symbol())
+	}
+
+	for len(queue) > 0 {
+		symbol := queue[0]
+		queue = queue[1:]
+
+		if symbol.Flags&ast.SymbolFlagsAlias != 0 {
+			if aliased := e.checker.GetAliasedSymbol(symbol); aliased != nil && aliased != symbol {
+				if path := e.symbolTargetPath(aliased); path != "" {
+					return path
+				}
+				enqueue(aliased)
+			}
+			if immediate := e.checker.GetImmediateAliasedSymbol(symbol); immediate != nil && immediate != symbol {
+				if path := e.symbolTargetPath(immediate); path != "" {
+					return path
+				}
+				enqueue(immediate)
+			}
+		}
+		exportSymbol := e.checker.GetExportSymbolOfSymbol(symbol)
+		if exportSymbol != nil && exportSymbol != symbol {
+			enqueue(exportSymbol)
+		}
+		if declaredType := e.checker.GetDeclaredTypeOfSymbol(symbol); declaredType != nil {
+			enqueue(declaredType.Symbol())
+		}
+		if path := e.symbolTargetPath(symbol); path != "" {
+			return path
+		}
+	}
+
+	return ""
+}
+
+func (e *extractor) enqueueTypeReferenceSymbols(nameNode *ast.Node, enqueue func(*ast.Symbol)) {
+	if nameNode == nil {
+		return
+	}
+
+	enqueue(e.checker.GetSymbolAtLocation(nameNode))
+
+	switch {
+	case ast.IsIdentifier(nameNode), ast.IsPrivateIdentifier(nameNode):
+		enqueue(e.checker.GetResolvedSymbol(nameNode))
+	case ast.IsQualifiedName(nameNode):
+		right := nameNode.AsQualifiedName().Right.AsNode()
+		enqueue(e.checker.GetSymbolAtLocation(right))
+		enqueue(e.checker.GetResolvedSymbol(right))
+	case ast.IsPropertyAccessExpression(nameNode):
+		right := nameNode.AsPropertyAccessExpression().Name().AsNode()
+		enqueue(e.checker.GetSymbolAtLocation(right))
+		enqueue(e.checker.GetResolvedSymbol(right))
+	}
+}
+
+func (e *extractor) symbolTargetPath(symbol *ast.Symbol) string {
+	if symbol == nil {
+		return ""
+	}
+	if path := e.nodeTargetPath(symbol.ValueDeclaration); path != "" {
+		return path
+	}
+	for _, decl := range symbol.Declarations {
+		if path := e.nodeTargetPath(decl); path != "" {
+			return path
+		}
+	}
+	return ""
+}
+
+func (e *extractor) nodeTargetPath(node *ast.Node) string {
+	if node == nil {
+		return ""
+	}
+	file := ast.GetSourceFileOfNode(node)
+	if file == nil {
+		return ""
+	}
+	fileName := normalizeSlash(file.FileName())
+	if !isWithinRoot(e.workspaceRoot, fileName) {
+		return ""
+	}
+	return e.relativePath(fileName)
 }
 
 func (e *extractor) moduleRange(file *ast.SourceFile) SourceLocation {
