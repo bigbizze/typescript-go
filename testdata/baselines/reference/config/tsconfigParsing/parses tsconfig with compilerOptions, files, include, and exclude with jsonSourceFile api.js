@@ -36,7 +36,7 @@ Fs::
 configFileName:: /apath/tsconfig.json
 CompilerOptions::
 {
-  "jsx": 3,
+  "jsx": 2,
   "module": 99,
   "moduleResolution": 100,
   "moduleDetection": 1,
@@ -49,6 +49,7 @@ CompilerOptions::
   },
   "strict": true,
   "target": 4,
+  "maxNodeModuleJsDepth": 1,
   "configFilePath": "/apath/tsconfig.json",
   "pathsBasePath": "/apath"
 }

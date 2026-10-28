@@ -14,7 +14,7 @@ export const b = 10;
 }
 
 tsgo -b -v --noCheck
-ExitStatus:: DiagnosticsPresent_OutputsGenerated
+ExitStatus:: DiagnosticsPresent_OutputsSkipped
 Output::
 [[90mHH:MM:SS AM[0m] Projects in this build: 
     * tsconfig.json
@@ -32,10 +32,12 @@ Output::
     [7m1[0m export const a = class { private p = 10; };
     [7m [0m [96m             ~[0m
 
+[[90mHH:MM:SS AM[0m] Updating unchanged output timestamps of project 'tsconfig.json'...
+
 
 Found 1 error in a.ts[90m:1[0m
 
-//// [/home/src/tslibs/TS/Lib/lib.es2025.full.d.ts] *Lib*
+//// [/home/src/tslibs/TS/Lib/lib.es2026.full.d.ts] *Lib*
 /// <reference no-default-lib="true"/>
 interface Boolean {}
 interface Function {}
@@ -58,13 +60,6 @@ interface Symbol {
     readonly [Symbol.toStringTag]: string;
 }
 declare const console: { log(msg: any): void; };
-//// [/home/src/workspaces/project/a.d.ts] *new* 
-export declare const a: {
-    new (): {
-        p: number;
-    };
-};
-
 //// [/home/src/workspaces/project/a.js] *new* 
 export const a = class {
     p = 10;
@@ -102,7 +97,7 @@ export const b = 10;
 
 tsconfig.json::
 SemanticDiagnostics::
-*not cached* /home/src/tslibs/TS/Lib/lib.es2025.full.d.ts
+*not cached* /home/src/tslibs/TS/Lib/lib.es2026.full.d.ts
 *not cached* /home/src/workspaces/project/a.ts
 *not cached* /home/src/workspaces/project/b.ts
 Signatures::
@@ -111,7 +106,7 @@ Signatures::
 Edit [0]:: no change
 
 tsgo -b -v --noCheck
-ExitStatus:: DiagnosticsPresent_OutputsGenerated
+ExitStatus:: DiagnosticsPresent_OutputsSkipped
 Output::
 [[90mHH:MM:SS AM[0m] Projects in this build: 
     * tsconfig.json
@@ -129,10 +124,11 @@ Output::
     [7m1[0m export const a = class { private p = 10; };
     [7m [0m [96m             ~[0m
 
+[[90mHH:MM:SS AM[0m] Updating unchanged output timestamps of project 'tsconfig.json'...
+
 
 Found 1 error in a.ts[90m:1[0m
 
-//// [/home/src/workspaces/project/a.d.ts] *rewrite with same content*
 //// [/home/src/workspaces/project/a.js] *rewrite with same content*
 //// [/home/src/workspaces/project/b.d.ts] *rewrite with same content*
 //// [/home/src/workspaces/project/b.js] *rewrite with same content*
@@ -141,7 +137,7 @@ Found 1 error in a.ts[90m:1[0m
 
 tsconfig.json::
 SemanticDiagnostics::
-*not cached* /home/src/tslibs/TS/Lib/lib.es2025.full.d.ts
+*not cached* /home/src/tslibs/TS/Lib/lib.es2026.full.d.ts
 *not cached* /home/src/workspaces/project/a.ts
 *not cached* /home/src/workspaces/project/b.ts
 Signatures::
@@ -161,7 +157,7 @@ Output::
 
 [[90mHH:MM:SS AM[0m] Building project 'tsconfig.json'...
 
-//// [/home/src/workspaces/project/a.d.ts] *modified* 
+//// [/home/src/workspaces/project/a.d.ts] *new* 
 export declare const a = "hello";
 
 //// [/home/src/workspaces/project/a.js] *modified* 
@@ -194,7 +190,7 @@ export const a = "hello";
 
 tsconfig.json::
 SemanticDiagnostics::
-*not cached* /home/src/tslibs/TS/Lib/lib.es2025.full.d.ts
+*not cached* /home/src/tslibs/TS/Lib/lib.es2026.full.d.ts
 *not cached* /home/src/workspaces/project/a.ts
 *not cached* /home/src/workspaces/project/b.ts
 Signatures::
@@ -253,7 +249,7 @@ Output::
 
 tsconfig.json::
 SemanticDiagnostics::
-*refresh*    /home/src/tslibs/TS/Lib/lib.es2025.full.d.ts
+*refresh*    /home/src/tslibs/TS/Lib/lib.es2026.full.d.ts
 *refresh*    /home/src/workspaces/project/a.ts
 *refresh*    /home/src/workspaces/project/b.ts
 Signatures::
@@ -290,7 +286,7 @@ Edit [6]:: Introduce error with noCheck
 export const a = class { private p = 10; };
 
 tsgo -b -v --noCheck
-ExitStatus:: DiagnosticsPresent_OutputsGenerated
+ExitStatus:: DiagnosticsPresent_OutputsSkipped
 Output::
 [[90mHH:MM:SS AM[0m] Projects in this build: 
     * tsconfig.json
@@ -308,16 +304,12 @@ Output::
     [7m1[0m export const a = class { private p = 10; };
     [7m [0m [96m             ~[0m
 
+[[90mHH:MM:SS AM[0m] Updating unchanged output timestamps of project 'tsconfig.json'...
+
 
 Found 1 error in a.ts[90m:1[0m
 
-//// [/home/src/workspaces/project/a.d.ts] *modified* 
-export declare const a: {
-    new (): {
-        p: number;
-    };
-};
-
+//// [/home/src/workspaces/project/a.d.ts] *mTime changed*
 //// [/home/src/workspaces/project/a.js] *modified* 
 export const a = class {
     p = 10;
@@ -351,7 +343,7 @@ export const a = class {
 
 tsconfig.json::
 SemanticDiagnostics::
-*not cached* /home/src/tslibs/TS/Lib/lib.es2025.full.d.ts
+*not cached* /home/src/tslibs/TS/Lib/lib.es2026.full.d.ts
 *not cached* /home/src/workspaces/project/a.ts
 *not cached* /home/src/workspaces/project/b.ts
 Signatures::
@@ -360,7 +352,7 @@ Signatures::
 Edit [7]:: no change
 
 tsgo -b -v --noCheck
-ExitStatus:: DiagnosticsPresent_OutputsGenerated
+ExitStatus:: DiagnosticsPresent_OutputsSkipped
 Output::
 [[90mHH:MM:SS AM[0m] Projects in this build: 
     * tsconfig.json
@@ -378,10 +370,12 @@ Output::
     [7m1[0m export const a = class { private p = 10; };
     [7m [0m [96m             ~[0m
 
+[[90mHH:MM:SS AM[0m] Updating unchanged output timestamps of project 'tsconfig.json'...
+
 
 Found 1 error in a.ts[90m:1[0m
 
-//// [/home/src/workspaces/project/a.d.ts] *rewrite with same content*
+//// [/home/src/workspaces/project/a.d.ts] *mTime changed*
 //// [/home/src/workspaces/project/a.js] *rewrite with same content*
 //// [/home/src/workspaces/project/b.d.ts] *rewrite with same content*
 //// [/home/src/workspaces/project/b.js] *rewrite with same content*
@@ -390,7 +384,7 @@ Found 1 error in a.ts[90m:1[0m
 
 tsconfig.json::
 SemanticDiagnostics::
-*not cached* /home/src/tslibs/TS/Lib/lib.es2025.full.d.ts
+*not cached* /home/src/tslibs/TS/Lib/lib.es2026.full.d.ts
 *not cached* /home/src/workspaces/project/a.ts
 *not cached* /home/src/workspaces/project/b.ts
 Signatures::
@@ -399,7 +393,7 @@ Signatures::
 Edit [8]:: No Change run with checking
 
 tsgo -b -v
-ExitStatus:: DiagnosticsPresent_OutputsGenerated
+ExitStatus:: DiagnosticsPresent_OutputsSkipped
 Output::
 [[90mHH:MM:SS AM[0m] Projects in this build: 
     * tsconfig.json
@@ -417,10 +411,12 @@ Output::
     [7m1[0m export const a = class { private p = 10; };
     [7m [0m [96m             ~[0m
 
+[[90mHH:MM:SS AM[0m] Updating unchanged output timestamps of project 'tsconfig.json'...
+
 
 Found 1 error in a.ts[90m:1[0m
 
-//// [/home/src/workspaces/project/a.d.ts] *rewrite with same content*
+//// [/home/src/workspaces/project/a.d.ts] *mTime changed*
 //// [/home/src/workspaces/project/a.js] *rewrite with same content*
 //// [/home/src/workspaces/project/b.d.ts] *rewrite with same content*
 //// [/home/src/workspaces/project/b.js] *rewrite with same content*
@@ -449,7 +445,7 @@ Found 1 error in a.ts[90m:1[0m
 
 tsconfig.json::
 SemanticDiagnostics::
-*refresh*    /home/src/tslibs/TS/Lib/lib.es2025.full.d.ts
+*refresh*    /home/src/tslibs/TS/Lib/lib.es2026.full.d.ts
 *refresh*    /home/src/workspaces/project/a.ts
 *refresh*    /home/src/workspaces/project/b.ts
 Signatures::
@@ -469,9 +465,7 @@ Output::
 
 [[90mHH:MM:SS AM[0m] Building project 'tsconfig.json'...
 
-//// [/home/src/workspaces/project/a.d.ts] *modified* 
-export declare const a = "hello";
-
+//// [/home/src/workspaces/project/a.d.ts] *rewrite with same content*
 //// [/home/src/workspaces/project/a.js] *modified* 
 export const a = "hello";
 
@@ -502,7 +496,7 @@ export const a = "hello";
 
 tsconfig.json::
 SemanticDiagnostics::
-*not cached* /home/src/tslibs/TS/Lib/lib.es2025.full.d.ts
+*not cached* /home/src/tslibs/TS/Lib/lib.es2026.full.d.ts
 *not cached* /home/src/workspaces/project/a.ts
 *not cached* /home/src/workspaces/project/b.ts
 Signatures::
@@ -548,7 +542,7 @@ Output::
 
 tsconfig.json::
 SemanticDiagnostics::
-*refresh*    /home/src/tslibs/TS/Lib/lib.es2025.full.d.ts
+*refresh*    /home/src/tslibs/TS/Lib/lib.es2026.full.d.ts
 *refresh*    /home/src/workspaces/project/a.ts
 *refresh*    /home/src/workspaces/project/b.ts
 Signatures::
@@ -617,7 +611,7 @@ export const c = "hello";
 
 tsconfig.json::
 SemanticDiagnostics::
-*refresh*    /home/src/tslibs/TS/Lib/lib.es2025.full.d.ts
+*refresh*    /home/src/tslibs/TS/Lib/lib.es2026.full.d.ts
 *refresh*    /home/src/workspaces/project/a.ts
 *refresh*    /home/src/workspaces/project/b.ts
 *refresh*    /home/src/workspaces/project/c.ts
@@ -629,7 +623,7 @@ Edit [12]:: Introduce error with noCheck
 export const a = class { private p = 10; };
 
 tsgo -b -v --noCheck
-ExitStatus:: DiagnosticsPresent_OutputsGenerated
+ExitStatus:: DiagnosticsPresent_OutputsSkipped
 Output::
 [[90mHH:MM:SS AM[0m] Projects in this build: 
     * tsconfig.json
@@ -647,16 +641,12 @@ Output::
     [7m1[0m export const a = class { private p = 10; };
     [7m [0m [96m             ~[0m
 
+[[90mHH:MM:SS AM[0m] Updating unchanged output timestamps of project 'tsconfig.json'...
+
 
 Found 1 error in a.ts[90m:1[0m
 
-//// [/home/src/workspaces/project/a.d.ts] *modified* 
-export declare const a: {
-    new (): {
-        p: number;
-    };
-};
-
+//// [/home/src/workspaces/project/a.d.ts] *mTime changed*
 //// [/home/src/workspaces/project/a.js] *modified* 
 export const a = class {
     p = 10;
@@ -698,7 +688,7 @@ export const a = class {
 
 tsconfig.json::
 SemanticDiagnostics::
-*not cached* /home/src/tslibs/TS/Lib/lib.es2025.full.d.ts
+*not cached* /home/src/tslibs/TS/Lib/lib.es2026.full.d.ts
 *not cached* /home/src/workspaces/project/a.ts
 *not cached* /home/src/workspaces/project/b.ts
 *not cached* /home/src/workspaces/project/c.ts
@@ -719,9 +709,7 @@ Output::
 
 [[90mHH:MM:SS AM[0m] Building project 'tsconfig.json'...
 
-//// [/home/src/workspaces/project/a.d.ts] *modified* 
-export declare const a = "hello";
-
+//// [/home/src/workspaces/project/a.d.ts] *rewrite with same content*
 //// [/home/src/workspaces/project/a.js] *modified* 
 export const a = "hello";
 
@@ -760,7 +748,7 @@ export const a = "hello";
 
 tsconfig.json::
 SemanticDiagnostics::
-*not cached* /home/src/tslibs/TS/Lib/lib.es2025.full.d.ts
+*not cached* /home/src/tslibs/TS/Lib/lib.es2026.full.d.ts
 *not cached* /home/src/workspaces/project/a.ts
 *not cached* /home/src/workspaces/project/b.ts
 *not cached* /home/src/workspaces/project/c.ts
@@ -824,7 +812,7 @@ Found 1 error in c.ts[90m:1[0m
 
 tsconfig.json::
 SemanticDiagnostics::
-*refresh*    /home/src/tslibs/TS/Lib/lib.es2025.full.d.ts
+*refresh*    /home/src/tslibs/TS/Lib/lib.es2026.full.d.ts
 *refresh*    /home/src/workspaces/project/a.ts
 *refresh*    /home/src/workspaces/project/b.ts
 *refresh*    /home/src/workspaces/project/c.ts
@@ -875,7 +863,7 @@ Found 1 error in c.ts[90m:1[0m
 
 tsconfig.json::
 SemanticDiagnostics::
-*refresh*    /home/src/tslibs/TS/Lib/lib.es2025.full.d.ts
+*refresh*    /home/src/tslibs/TS/Lib/lib.es2026.full.d.ts
 *refresh*    /home/src/workspaces/project/a.ts
 *refresh*    /home/src/workspaces/project/b.ts
 *refresh*    /home/src/workspaces/project/c.ts

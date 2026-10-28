@@ -40,7 +40,7 @@ Output::
   ],
   "size": 45
 }
-//// [/home/src/tslibs/TS/Lib/lib.es2025.full.d.ts] *Lib*
+//// [/home/src/tslibs/TS/Lib/lib.es2026.full.d.ts] *Lib*
 /// <reference no-default-lib="true"/>
 interface Boolean {}
 interface Function {}
@@ -64,9 +64,12 @@ interface Symbol {
 }
 declare const console: { log(msg: any): void; };
 
+Watch Registrations::
+Directory watches::
+  /home/src/projects/project (recursive)
 tsconfig.json::
 SemanticDiagnostics::
-*refresh*    /home/src/tslibs/TS/Lib/lib.es2025.full.d.ts
+*refresh*    /home/src/tslibs/TS/Lib/lib.es2026.full.d.ts
 *refresh*    /home/src/projects/project/a.ts
 Signatures::
 
@@ -91,9 +94,12 @@ Output::
 //// [/home/src/projects/project/tsconfig.tsbuildinfo] *rewrite with same content*
 //// [/home/src/projects/project/tsconfig.tsbuildinfo.readable.baseline.txt] *rewrite with same content*
 
+Watch Registrations::
+Directory watches::
+  /home/src/projects/project (recursive)
 tsconfig.json::
 SemanticDiagnostics::
-*refresh*    /home/src/tslibs/TS/Lib/lib.es2025.full.d.ts
+*refresh*    /home/src/tslibs/TS/Lib/lib.es2026.full.d.ts
 *refresh*    /home/src/projects/project/a.ts
 Signatures::
 
@@ -127,9 +133,12 @@ const a = "hello";
 //// [/home/src/projects/project/tsconfig.tsbuildinfo] *rewrite with same content*
 //// [/home/src/projects/project/tsconfig.tsbuildinfo.readable.baseline.txt] *rewrite with same content*
 
+Watch Registrations::
+Directory watches::
+  /home/src/projects/project (recursive)
 tsconfig.json::
 SemanticDiagnostics::
-*refresh*    /home/src/tslibs/TS/Lib/lib.es2025.full.d.ts
+*refresh*    /home/src/tslibs/TS/Lib/lib.es2026.full.d.ts
 *refresh*    /home/src/projects/project/a.ts
 Signatures::
 
@@ -159,9 +168,12 @@ Output::
 //// [/home/src/projects/project/tsconfig.tsbuildinfo] *rewrite with same content*
 //// [/home/src/projects/project/tsconfig.tsbuildinfo.readable.baseline.txt] *rewrite with same content*
 
+Watch Registrations::
+Directory watches::
+  /home/src/projects/project (recursive)
 tsconfig.json::
 SemanticDiagnostics::
-*refresh*    /home/src/tslibs/TS/Lib/lib.es2025.full.d.ts
+*refresh*    /home/src/tslibs/TS/Lib/lib.es2026.full.d.ts
 *refresh*    /home/src/projects/project/a.ts
 Signatures::
 
@@ -186,9 +198,12 @@ Output::
 //// [/home/src/projects/project/tsconfig.tsbuildinfo] *rewrite with same content*
 //// [/home/src/projects/project/tsconfig.tsbuildinfo.readable.baseline.txt] *rewrite with same content*
 
+Watch Registrations::
+Directory watches::
+  /home/src/projects/project (recursive)
 tsconfig.json::
 SemanticDiagnostics::
-*refresh*    /home/src/tslibs/TS/Lib/lib.es2025.full.d.ts
+*refresh*    /home/src/tslibs/TS/Lib/lib.es2026.full.d.ts
 *refresh*    /home/src/projects/project/a.ts
 Signatures::
 
@@ -224,9 +239,12 @@ const a = class {
 //// [/home/src/projects/project/tsconfig.tsbuildinfo] *rewrite with same content*
 //// [/home/src/projects/project/tsconfig.tsbuildinfo.readable.baseline.txt] *rewrite with same content*
 
+Watch Registrations::
+Directory watches::
+  /home/src/projects/project (recursive)
 tsconfig.json::
 SemanticDiagnostics::
-*refresh*    /home/src/tslibs/TS/Lib/lib.es2025.full.d.ts
+*refresh*    /home/src/tslibs/TS/Lib/lib.es2026.full.d.ts
 *refresh*    /home/src/projects/project/a.ts
 Signatures::
 
@@ -256,8 +274,11 @@ Output::
 //// [/home/src/projects/project/tsconfig.tsbuildinfo] *rewrite with same content*
 //// [/home/src/projects/project/tsconfig.tsbuildinfo.readable.baseline.txt] *rewrite with same content*
 
+Watch Registrations::
+Directory watches::
+  /home/src/projects/project (recursive)
 tsconfig.json::
 SemanticDiagnostics::
-*refresh*    /home/src/tslibs/TS/Lib/lib.es2025.full.d.ts
+*refresh*    /home/src/tslibs/TS/Lib/lib.es2026.full.d.ts
 *refresh*    /home/src/projects/project/a.ts
 Signatures::
