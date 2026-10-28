@@ -19,8 +19,9 @@ import (
 )
 
 type BuildSnapshotRequest struct {
-	WorkspaceRoot string
-	Files         []string
+	WorkspaceRoot   string
+	Files           []string
+	AmbientMatchers []AmbientMatcher
 }
 
 type SourceLocation struct {
@@ -112,6 +113,7 @@ type Snapshot struct {
 	ImportEdges     []ImportEdge
 	CallEdges       []CallEdge
 	TypeRefs        []TypeRef
+	AmbientUses     []AmbientUse
 	PendingDtsCalls []PendingDtsCall
 }
 
@@ -134,11 +136,15 @@ type extractor struct {
 	importCount     map[string]int
 	callCount       map[string]int
 	typeRefCount    map[string]int
+	ambientCount    map[string]int
 	functions       []Function
 	imports         []ImportEdge
 	calls           []CallEdge
 	typeRefs        []TypeRef
+	ambientUses     []AmbientUse
 	pendingDtsCalls []PendingDtsCall
+	ambient         *ambientIndex
+	ambientFile     *ambientFileState
 	debugCalls      bool
 }
 
@@ -174,7 +180,7 @@ func BuildSnapshot(ctx context.Context, req BuildSnapshotRequest) (*Snapshot, er
 	merged := &Snapshot{}
 	missing := make(map[string]struct{})
 	for _, group := range groups {
-		partial, groupMissing, err := buildSnapshotForGroup(ctx, workspaceRoot, files, group)
+		partial, groupMissing, err := buildSnapshotForGroup(ctx, workspaceRoot, files, group, req.AmbientMatchers)
 		if err != nil {
 			return nil, err
 		}
@@ -189,7 +195,7 @@ func BuildSnapshot(ctx context.Context, req BuildSnapshotRequest) (*Snapshot, er
 			fallbackFiles = append(fallbackFiles, file)
 		}
 		slices.Sort(fallbackFiles)
-		partial, _, err := buildSnapshotForGroup(ctx, workspaceRoot, files, configGroup{PrimaryFiles: fallbackFiles})
+		partial, _, err := buildSnapshotForGroup(ctx, workspaceRoot, files, configGroup{PrimaryFiles: fallbackFiles}, req.AmbientMatchers)
 		if err != nil {
 			return nil, err
 		}
@@ -239,7 +245,7 @@ func resolveDtsCalls(snap *Snapshot) {
 	snap.PendingDtsCalls = nil
 }
 
-func buildSnapshotForGroup(ctx context.Context, workspaceRoot string, requestedFiles []string, group configGroup) (*Snapshot, []string, error) {
+func buildSnapshotForGroup(ctx context.Context, workspaceRoot string, requestedFiles []string, group configGroup, ambientMatchers []AmbientMatcher) (*Snapshot, []string, error) {
 	host := compiler.NewCompilerHost(
 		bundled.WrapFS(osvfs.FS()),
 		bundled.LibPath(),
@@ -276,6 +282,8 @@ func buildSnapshotForGroup(ctx context.Context, workspaceRoot string, requestedF
 		importCount:    make(map[string]int),
 		callCount:      make(map[string]int),
 		typeRefCount:   make(map[string]int),
+		ambientCount:   make(map[string]int),
+		ambient:        newAmbientIndex(ambientMatchers),
 		debugCalls:     os.Getenv("LINTAI_DEBUG_CALLS") == "1",
 	}
 	for _, file := range requestedFiles {
@@ -318,8 +326,10 @@ func buildSnapshotForGroup(ctx context.Context, workspaceRoot string, requestedF
 		if sourceFile == nil {
 			continue
 		}
+		ex.beginAmbientFile(sourceFile)
 		ex.walkFacts(sourceFile.AsNode(), nil)
 	}
+	ex.ambientFile = nil
 
 	partial := &Snapshot{
 		Modules:         modules,
@@ -327,6 +337,7 @@ func buildSnapshotForGroup(ctx context.Context, workspaceRoot string, requestedF
 		ImportEdges:     ex.imports,
 		CallEdges:       ex.calls,
 		TypeRefs:        ex.typeRefs,
+		AmbientUses:     ex.ambientUses,
 		PendingDtsCalls: ex.pendingDtsCalls,
 	}
 	sortSnapshot(partial)
@@ -438,6 +449,7 @@ func mergeSnapshot(into *Snapshot, partial *Snapshot) {
 	into.ImportEdges = mergeImportEdges(into.ImportEdges, partial.ImportEdges)
 	into.CallEdges = mergeCallEdges(into.CallEdges, partial.CallEdges)
 	into.TypeRefs = mergeTypeRefs(into.TypeRefs, partial.TypeRefs)
+	into.AmbientUses = mergeAmbientUses(into.AmbientUses, partial.AmbientUses)
 	into.PendingDtsCalls = append(into.PendingDtsCalls, partial.PendingDtsCalls...)
 }
 
@@ -447,6 +459,7 @@ func sortSnapshot(snapshot *Snapshot) {
 	slices.SortFunc(snapshot.ImportEdges, func(a, b ImportEdge) int { return strings.Compare(a.SemanticKey, b.SemanticKey) })
 	slices.SortFunc(snapshot.CallEdges, func(a, b CallEdge) int { return strings.Compare(a.SemanticKey, b.SemanticKey) })
 	slices.SortFunc(snapshot.TypeRefs, func(a, b TypeRef) int { return strings.Compare(a.SemanticKey, b.SemanticKey) })
+	slices.SortFunc(snapshot.AmbientUses, func(a, b AmbientUse) int { return strings.Compare(a.SemanticKey, b.SemanticKey) })
 }
 
 func mergeModules(existing []Module, incoming []Module) []Module {
@@ -553,11 +566,14 @@ func (e *extractor) walkFacts(node *ast.Node, currentFunction *functionState) {
 		if currentFunction != nil {
 			e.collectCall(currentFunction.record, node)
 		}
+	case ast.IsIdentifier(node):
+		if e.ambientFile != nil {
+			e.matchAmbient(node, currentFunction)
+		}
 	}
 
 	nextFunction := currentFunction
 	if ast.IsFunctionLike(node) {
-		nextFunction = nil
 		if record := e.lookupFunction(node); record != nil {
 			nextFunction = &functionState{record: record}
 		}
