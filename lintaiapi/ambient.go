@@ -476,18 +476,3 @@ func isWriteTarget(node *ast.Node) bool {
 	}
 	return false
 }
-
-func mergeAmbientUses(existing []AmbientUse, incoming []AmbientUse) []AmbientUse {
-	seen := make(map[string]struct{}, len(existing))
-	for _, item := range existing {
-		seen[item.EntityID] = struct{}{}
-	}
-	for _, item := range incoming {
-		if _, ok := seen[item.EntityID]; ok {
-			continue
-		}
-		existing = append(existing, item)
-		seen[item.EntityID] = struct{}{}
-	}
-	return existing
-}

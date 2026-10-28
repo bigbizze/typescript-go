@@ -13,9 +13,20 @@ import (
 	"github.com/microsoft/TypeScript/tsc/internal/checker"
 	"github.com/microsoft/TypeScript/tsc/internal/compiler"
 	"github.com/microsoft/TypeScript/tsc/internal/core"
+	"github.com/microsoft/TypeScript/tsc/internal/module"
+	"github.com/microsoft/TypeScript/tsc/internal/scanner"
 	"github.com/microsoft/TypeScript/tsc/internal/tsoptions"
 	"github.com/microsoft/TypeScript/tsc/internal/tspath"
 	"github.com/microsoft/TypeScript/tsc/internal/vfs/osvfs"
+)
+
+const (
+	ImportFormStatic       = "static"
+	ImportFormReexport     = "reexport"
+	ImportFormDynamic      = "dynamic"
+	ImportFormRequire      = "require"
+	ImportFormImportEquals = "import_equals"
+	ImportFormImportType   = "import_type"
 )
 
 type BuildSnapshotRequest struct {
@@ -69,6 +80,10 @@ type ImportEdge struct {
 	Specifier          string
 	FromPath           string
 	ToPath             string
+	Form               string
+	Internal           bool
+	Unresolved         bool
+	Package            string
 	ImportedSymbols    []ImportedSymbol
 	HasDefaultImport   bool
 	HasNamespaceImport bool
@@ -77,16 +92,49 @@ type ImportEdge struct {
 	Range              SourceLocation
 }
 
+// CallEdge is a call from a collected function, or from module scope when
+// FromModule is set, to a collected function. For a module-scope call,
+// FromSemanticKey is the workspace-relative path of the module.
 type CallEdge struct {
 	EntityID        string
 	SemanticKey     string
 	FromSemanticKey string
+	FromModule      bool
 	ToSemanticKey   string
 	FromName        string
 	ToName          string
 	FromPath        string
 	ToPath          string
 	Range           SourceLocation
+}
+
+// ExternalCall is a call whose resolved declaration is in a declaration file
+// or outside the workspace: the default library, a package or a .d.ts file.
+type ExternalCall struct {
+	EntityID        string
+	SemanticKey     string
+	FromSemanticKey string
+	FromModule      bool
+	FromPath        string
+	Module          string
+	Name            string
+	Range           SourceLocation
+}
+
+type ModuleDirective struct {
+	EntityID    string
+	SemanticKey string
+	FilePath    string
+	Text        string
+	Range       SourceLocation
+}
+
+type ParseError struct {
+	EntityID    string
+	SemanticKey string
+	FilePath    string
+	Message     string
+	Range       SourceLocation
 }
 
 type TypeRef struct {
@@ -102,6 +150,7 @@ type PendingDtsCall struct {
 	DtsPath         string
 	TargetName      string
 	FromSemanticKey string
+	FromModule      bool
 	FromName        string
 	FromPath        string
 	Range           SourceLocation
@@ -112,8 +161,11 @@ type Snapshot struct {
 	Functions       []Function
 	ImportEdges     []ImportEdge
 	CallEdges       []CallEdge
+	ExternalCalls   []ExternalCall
 	TypeRefs        []TypeRef
 	AmbientUses     []AmbientUse
+	Directives      []ModuleDirective
+	ParseErrors     []ParseError
 	PendingDtsCalls []PendingDtsCall
 }
 
@@ -125,6 +177,7 @@ type configGroup struct {
 type extractor struct {
 	workspaceRoot   string
 	program         *compiler.Program
+	resolver        *module.DefaultResolver
 	checker         *checker.Checker
 	requestedFiles  map[string]struct{}
 	primaryFiles    map[string]struct{}
@@ -135,11 +188,13 @@ type extractor struct {
 	functionCount   map[string]int
 	importCount     map[string]int
 	callCount       map[string]int
+	externalCount   map[string]int
 	typeRefCount    map[string]int
 	ambientCount    map[string]int
 	functions       []Function
 	imports         []ImportEdge
 	calls           []CallEdge
+	externalCalls   []ExternalCall
 	typeRefs        []TypeRef
 	ambientUses     []AmbientUse
 	pendingDtsCalls []PendingDtsCall
@@ -154,10 +209,19 @@ type functionMeta struct {
 	nameNode     *ast.Node
 	namingSource *ast.Node
 	lookupNodes  []*ast.Node
+	exported     bool
 }
 
 type functionState struct {
 	record *Function
+}
+
+// callSource is the caller of a call: a collected function, or module scope.
+type callSource struct {
+	key    string
+	name   string
+	path   string
+	module bool
 }
 
 func BuildSnapshot(ctx context.Context, req BuildSnapshotRequest) (*Snapshot, error) {
@@ -234,6 +298,7 @@ func resolveDtsCalls(snap *Snapshot) {
 			EntityID:        "call:" + baseKey,
 			SemanticKey:     baseKey,
 			FromSemanticKey: pending.FromSemanticKey,
+			FromModule:      pending.FromModule,
 			ToSemanticKey:   target.SemanticKey,
 			FromName:        pending.FromName,
 			ToName:          target.Name,
@@ -281,6 +346,7 @@ func buildSnapshotForGroup(ctx context.Context, workspaceRoot string, requestedF
 		functionCount:  make(map[string]int),
 		importCount:    make(map[string]int),
 		callCount:      make(map[string]int),
+		externalCount:  make(map[string]int),
 		typeRefCount:   make(map[string]int),
 		ambientCount:   make(map[string]int),
 		ambient:        newAmbientIndex(ambientMatchers),
@@ -297,6 +363,8 @@ func buildSnapshotForGroup(ctx context.Context, workspaceRoot string, requestedF
 	}
 
 	modules := make([]Module, 0, len(group.PrimaryFiles))
+	directives := make([]ModuleDirective, 0)
+	parseErrors := make([]ParseError, 0)
 	missingPrimary := make([]string, 0)
 	for _, file := range group.PrimaryFiles {
 		sourceFile := ex.filesByPath[file]
@@ -311,6 +379,10 @@ func buildSnapshotForGroup(ctx context.Context, workspaceRoot string, requestedF
 			Path:        relative,
 			Range:       ex.moduleRange(sourceFile),
 		})
+		directives = append(directives, ex.moduleDirectives(sourceFile, relative)...)
+		if parseError, ok := ex.moduleParseError(sourceFile, relative); ok {
+			parseErrors = append(parseErrors, parseError)
+		}
 	}
 
 	for _, file := range requestedFiles {
@@ -336,8 +408,11 @@ func buildSnapshotForGroup(ctx context.Context, workspaceRoot string, requestedF
 		Functions:       ex.functions,
 		ImportEdges:     ex.imports,
 		CallEdges:       ex.calls,
+		ExternalCalls:   ex.externalCalls,
 		TypeRefs:        ex.typeRefs,
 		AmbientUses:     ex.ambientUses,
+		Directives:      directives,
+		ParseErrors:     parseErrors,
 		PendingDtsCalls: ex.pendingDtsCalls,
 	}
 	sortSnapshot(partial)
@@ -444,12 +519,15 @@ func findNearestConfigPath(workspaceRoot string, file string) (string, error) {
 }
 
 func mergeSnapshot(into *Snapshot, partial *Snapshot) {
-	into.Modules = mergeModules(into.Modules, partial.Modules)
-	into.Functions = mergeFunctions(into.Functions, partial.Functions)
-	into.ImportEdges = mergeImportEdges(into.ImportEdges, partial.ImportEdges)
-	into.CallEdges = mergeCallEdges(into.CallEdges, partial.CallEdges)
-	into.TypeRefs = mergeTypeRefs(into.TypeRefs, partial.TypeRefs)
-	into.AmbientUses = mergeAmbientUses(into.AmbientUses, partial.AmbientUses)
+	into.Modules = mergeByEntityID(into.Modules, partial.Modules, func(item Module) string { return item.EntityID })
+	into.Functions = mergeByEntityID(into.Functions, partial.Functions, func(item Function) string { return item.EntityID })
+	into.ImportEdges = mergeByEntityID(into.ImportEdges, partial.ImportEdges, func(item ImportEdge) string { return item.EntityID })
+	into.CallEdges = mergeByEntityID(into.CallEdges, partial.CallEdges, func(item CallEdge) string { return item.EntityID })
+	into.ExternalCalls = mergeByEntityID(into.ExternalCalls, partial.ExternalCalls, func(item ExternalCall) string { return item.EntityID })
+	into.TypeRefs = mergeByEntityID(into.TypeRefs, partial.TypeRefs, func(item TypeRef) string { return item.EntityID })
+	into.AmbientUses = mergeByEntityID(into.AmbientUses, partial.AmbientUses, func(item AmbientUse) string { return item.EntityID })
+	into.Directives = mergeByEntityID(into.Directives, partial.Directives, func(item ModuleDirective) string { return item.EntityID })
+	into.ParseErrors = mergeByEntityID(into.ParseErrors, partial.ParseErrors, func(item ParseError) string { return item.EntityID })
 	into.PendingDtsCalls = append(into.PendingDtsCalls, partial.PendingDtsCalls...)
 }
 
@@ -458,81 +536,25 @@ func sortSnapshot(snapshot *Snapshot) {
 	slices.SortFunc(snapshot.Functions, func(a, b Function) int { return strings.Compare(a.SemanticKey, b.SemanticKey) })
 	slices.SortFunc(snapshot.ImportEdges, func(a, b ImportEdge) int { return strings.Compare(a.SemanticKey, b.SemanticKey) })
 	slices.SortFunc(snapshot.CallEdges, func(a, b CallEdge) int { return strings.Compare(a.SemanticKey, b.SemanticKey) })
+	slices.SortFunc(snapshot.ExternalCalls, func(a, b ExternalCall) int { return strings.Compare(a.SemanticKey, b.SemanticKey) })
 	slices.SortFunc(snapshot.TypeRefs, func(a, b TypeRef) int { return strings.Compare(a.SemanticKey, b.SemanticKey) })
 	slices.SortFunc(snapshot.AmbientUses, func(a, b AmbientUse) int { return strings.Compare(a.SemanticKey, b.SemanticKey) })
+	slices.SortFunc(snapshot.Directives, func(a, b ModuleDirective) int { return strings.Compare(a.SemanticKey, b.SemanticKey) })
+	slices.SortFunc(snapshot.ParseErrors, func(a, b ParseError) int { return strings.Compare(a.SemanticKey, b.SemanticKey) })
 }
 
-func mergeModules(existing []Module, incoming []Module) []Module {
+func mergeByEntityID[T any](existing []T, incoming []T, entityID func(T) string) []T {
 	seen := make(map[string]struct{}, len(existing))
 	for _, item := range existing {
-		seen[item.EntityID] = struct{}{}
+		seen[entityID(item)] = struct{}{}
 	}
 	for _, item := range incoming {
-		if _, ok := seen[item.EntityID]; ok {
+		id := entityID(item)
+		if _, ok := seen[id]; ok {
 			continue
 		}
 		existing = append(existing, item)
-		seen[item.EntityID] = struct{}{}
-	}
-	return existing
-}
-
-func mergeFunctions(existing []Function, incoming []Function) []Function {
-	seen := make(map[string]struct{}, len(existing))
-	for _, item := range existing {
-		seen[item.EntityID] = struct{}{}
-	}
-	for _, item := range incoming {
-		if _, ok := seen[item.EntityID]; ok {
-			continue
-		}
-		existing = append(existing, item)
-		seen[item.EntityID] = struct{}{}
-	}
-	return existing
-}
-
-func mergeImportEdges(existing []ImportEdge, incoming []ImportEdge) []ImportEdge {
-	seen := make(map[string]struct{}, len(existing))
-	for _, item := range existing {
-		seen[item.EntityID] = struct{}{}
-	}
-	for _, item := range incoming {
-		if _, ok := seen[item.EntityID]; ok {
-			continue
-		}
-		existing = append(existing, item)
-		seen[item.EntityID] = struct{}{}
-	}
-	return existing
-}
-
-func mergeCallEdges(existing []CallEdge, incoming []CallEdge) []CallEdge {
-	seen := make(map[string]struct{}, len(existing))
-	for _, item := range existing {
-		seen[item.EntityID] = struct{}{}
-	}
-	for _, item := range incoming {
-		if _, ok := seen[item.EntityID]; ok {
-			continue
-		}
-		existing = append(existing, item)
-		seen[item.EntityID] = struct{}{}
-	}
-	return existing
-}
-
-func mergeTypeRefs(existing []TypeRef, incoming []TypeRef) []TypeRef {
-	seen := make(map[string]struct{}, len(existing))
-	for _, item := range existing {
-		seen[item.EntityID] = struct{}{}
-	}
-	for _, item := range incoming {
-		if _, ok := seen[item.EntityID]; ok {
-			continue
-		}
-		existing = append(existing, item)
-		seen[item.EntityID] = struct{}{}
+		seen[id] = struct{}{}
 	}
 	return existing
 }
@@ -556,16 +578,26 @@ func (e *extractor) walkFacts(node *ast.Node, currentFunction *functionState) {
 	}
 	switch {
 	case ast.IsImportDeclaration(node):
-		e.collectImport(node)
+		e.collectImport(node, node.ModuleSpecifier(), ImportFormStatic, node.ImportClause() != nil && node.ImportClause().IsTypeOnly())
+	case ast.IsExportDeclaration(node) && node.ModuleSpecifier() != nil:
+		e.collectImport(node, node.ModuleSpecifier(), ImportFormReexport, node.IsTypeOnly())
+	case ast.IsExternalModuleImportEqualsDeclaration(node):
+		e.collectImport(node, node.AsImportEqualsDeclaration().ModuleReference.Expression(), ImportFormImportEquals, node.IsTypeOnly())
+	case ast.IsLiteralImportTypeNode(node):
+		e.collectImport(node, node.AsImportTypeNode().Argument.AsLiteralTypeNode().Literal, ImportFormImportType, true)
+	case ast.IsImportCall(node):
+		if arguments := node.Arguments(); len(arguments) > 0 {
+			e.collectImport(node, arguments[0], ImportFormDynamic, false)
+		}
+	case ast.IsRequireCall(node, true):
+		e.collectImport(node, node.Arguments()[0], ImportFormRequire, false)
 	case ast.IsTypeReferenceNode(node):
 		e.collectTypeRef(node.AsTypeReferenceNode().TypeName, node.AsTypeReferenceNode().TypeName.AsNode())
 	case ast.IsExpressionWithTypeArguments(node):
 		expression := node.AsExpressionWithTypeArguments().Expression
 		e.collectTypeRef(expression.AsNode(), expression.AsNode())
 	case ast.IsCallExpression(node):
-		if currentFunction != nil {
-			e.collectCall(currentFunction.record, node)
-		}
+		e.collectCall(e.callSourceFor(node, currentFunction), node)
 	case ast.IsIdentifier(node):
 		if e.ambientFile != nil {
 			e.matchAmbient(node, currentFunction)
@@ -609,7 +641,7 @@ func (e *extractor) collectFunction(node *ast.Node) *Function {
 		displayName = containerName + "." + meta.localName
 	}
 
-	nameRange := e.location(file, meta.nameNode.Pos(), meta.nameNode.End())
+	nameRange := e.nodeLocation(file, meta.nameNode)
 	baseKey := fmt.Sprintf("%s::%s::%s", nameRange.File, meta.kind, displayName)
 	semanticKey := withOrdinal(baseKey, nextOrdinal(e.functionCount, baseKey))
 	record := Function{
@@ -620,7 +652,7 @@ func (e *extractor) collectFunction(node *ast.Node) *Function {
 		FilePath:           nameRange.File,
 		ContainerName:      containerName,
 		ContainsAwait:      containsAwait(node),
-		IsExported:         e.isExportedFunction(node, meta),
+		IsExported:         meta.exported || e.isExportedFunction(node, meta),
 		IsAsync:            ast.HasSyntacticModifier(node, ast.ModifierFlagsAsync),
 		ParameterCount:     len(node.Parameters()),
 		ReturnTypeText:     e.functionReturnTypeText(node),
@@ -652,7 +684,7 @@ func (e *extractor) collectFunction(node *ast.Node) *Function {
 	return stored
 }
 
-func (e *extractor) collectImport(node *ast.Node) {
+func (e *extractor) collectImport(node *ast.Node, moduleSpecifier *ast.Node, form string, typeOnly bool) {
 	file := ast.GetSourceFileOfNode(node)
 	if file == nil {
 		return
@@ -661,155 +693,318 @@ func (e *extractor) collectImport(node *ast.Node) {
 	if _, ok := e.primaryFiles[fileName]; !ok {
 		return
 	}
-	moduleSpecifier := node.ModuleSpecifier()
 	if moduleSpecifier == nil || !ast.IsStringLiteralLike(moduleSpecifier) {
 		return
 	}
 	specifier := moduleSpecifier.Text()
 	fromPath := e.relativePath(fileName)
 	toPath := specifier
-	if resolved := e.program.GetResolvedModuleFromModuleSpecifier(file, moduleSpecifier); resolved != nil && resolved.IsResolved() {
+	internal := false
+	unresolved := false
+	packageName := ""
+	if resolved := e.resolveModuleSpecifier(file, moduleSpecifier); resolved.IsResolved() {
 		resolvedPath := normalizeSlash(resolved.ResolvedFileName.AsString())
-		if isWithinRoot(e.workspaceRoot, resolvedPath) {
+		if isWithinRoot(e.workspaceRoot, resolvedPath) && !strings.Contains(resolvedPath, "/node_modules/") {
+			internal = true
 			toPath = e.relativePath(resolvedPath)
+			packageName = resolved.PackageId.Name
+		} else {
+			packageName = packageNameFromSpecifier(specifier)
 		}
+	} else if e.checker.ResolveExternalModuleName(moduleSpecifier, nil) != nil {
+		packageName = packageNameFromSpecifier(specifier)
+	} else {
+		unresolved = true
 	}
-	location := e.location(file, moduleSpecifier.Pos(), moduleSpecifier.End())
+	location := e.nodeLocation(file, moduleSpecifier)
 	baseKey := fmt.Sprintf("%s::import::%s", fromPath, specifier)
 	semanticKey := withOrdinal(baseKey, nextOrdinal(e.importCount, baseKey))
-	importedSymbols, hasDefaultImport, hasNamespaceImport, hasNamedImports, isTypeOnly := extractImportedSymbols(node)
+	importedSymbols, hasDefaultImport, hasNamespaceImport, hasNamedImports := extractImportedSymbols(node, typeOnly)
 	e.imports = append(e.imports, ImportEdge{
 		EntityID:           "import:" + semanticKey,
 		SemanticKey:        semanticKey,
 		Specifier:          specifier,
 		FromPath:           fromPath,
 		ToPath:             toPath,
+		Form:               form,
+		Internal:           internal,
+		Unresolved:         unresolved,
+		Package:            packageName,
 		ImportedSymbols:    importedSymbols,
 		HasDefaultImport:   hasDefaultImport,
 		HasNamespaceImport: hasNamespaceImport,
 		HasNamedImports:    hasNamedImports,
-		IsTypeOnly:         isTypeOnly,
+		IsTypeOnly:         typeOnly,
 		Range:              location,
 	})
 }
 
-func (e *extractor) collectCall(source *Function, node *ast.Node) {
-	target := e.resolveCallTarget(node)
-	if target == nil {
-		e.recordPendingDtsCall(source, node)
-		return
+// resolveModuleSpecifier returns the program's resolution of a specifier. The
+// program does not resolve some specifiers, for example require() calls in
+// TypeScript files, so it falls back to the program's resolver.
+func (e *extractor) resolveModuleSpecifier(file *ast.SourceFile, moduleSpecifier *ast.Node) *module.ResolvedModule {
+	if resolved := e.program.GetResolvedModuleFromModuleSpecifier(file, moduleSpecifier); resolved.IsResolved() {
+		return resolved
 	}
+	mode := e.program.GetModeForUsageLocation(file, moduleSpecifier)
+	if e.resolver == nil {
+		e.resolver = e.program.NewModuleResolver()
+	}
+	resolved, _, _ := e.resolver.ResolveModuleName(moduleSpecifier.Text(), file.FileName(), mode, nil)
+	return resolved
+}
+
+// packageNameFromSpecifier returns the package part of a bare specifier:
+// "next" for "next/server" and "@scope/pkg" for "@scope/pkg/sub".
+func packageNameFromSpecifier(specifier string) string {
+	if specifier == "" || tspath.IsExternalModuleNameRelative(specifier) {
+		return ""
+	}
+	parts := strings.Split(specifier, "/")
+	if strings.HasPrefix(specifier, "@") && len(parts) > 1 {
+		return parts[0] + "/" + parts[1]
+	}
+	return parts[0]
+}
+
+func (e *extractor) callSourceFor(node *ast.Node, currentFunction *functionState) callSource {
+	if currentFunction != nil {
+		record := currentFunction.record
+		return callSource{key: record.SemanticKey, name: record.Name, path: record.FilePath}
+	}
+	relative := e.relativePath(normalizeSlash(ast.GetSourceFileOfNode(node).FileName().AsString()))
+	return callSource{key: relative, name: relative, path: relative, module: true}
+}
+
+func (e *extractor) collectCall(source callSource, node *ast.Node) {
 	file := ast.GetSourceFileOfNode(node)
 	if file == nil {
 		return
 	}
-	calleeNode := node.Expression()
-	if ast.IsPropertyAccessExpression(calleeNode) {
-		calleeNode = calleeNode.Name().AsNode()
+	if _, ok := e.primaryFiles[normalizeSlash(file.FileName().AsString())]; !ok {
+		return
 	}
-	location := e.location(file, calleeNode.Pos(), calleeNode.End())
-	baseKey := fmt.Sprintf("%s::calls::%s", source.SemanticKey, target.SemanticKey)
+	target, declaration := e.resolveCallTarget(node)
+	location := e.nodeLocation(file, calleeNameNode(node))
+	if target == nil {
+		if declaration == nil || e.recordPendingDtsCall(source, declaration, location) {
+			return
+		}
+		e.recordExternalCall(source, node, declaration, location)
+		return
+	}
+	baseKey := fmt.Sprintf("%s::calls::%s", source.key, target.SemanticKey)
 	semanticKey := withOrdinal(baseKey, nextOrdinal(e.callCount, baseKey))
 	e.calls = append(e.calls, CallEdge{
 		EntityID:        "call:" + semanticKey,
 		SemanticKey:     semanticKey,
-		FromSemanticKey: source.SemanticKey,
+		FromSemanticKey: source.key,
+		FromModule:      source.module,
 		ToSemanticKey:   target.SemanticKey,
-		FromName:        source.Name,
+		FromName:        source.name,
 		ToName:          target.Name,
-		FromPath:        source.FilePath,
+		FromPath:        source.path,
 		ToPath:          target.FilePath,
 		Range:           location,
 	})
 }
 
-func (e *extractor) resolveCallTarget(node *ast.Node) *Function {
-	if signature := e.checker.GetResolvedSignature(node); signature != nil {
-		decl := signature.Declaration()
-		if target := e.lookupFunction(decl); target != nil {
-			return target
-		}
-		if decl != nil {
-			if sym := decl.Symbol(); sym != nil {
-				if target := e.lookupFunction(sym); target != nil {
-					return target
-				}
-			}
-		}
+func calleeNameNode(node *ast.Node) *ast.Node {
+	callee := ast.SkipParentheses(node.Expression())
+	if ast.IsPropertyAccessExpression(callee) {
+		return callee.Name().AsNode()
 	}
-	expression := node.Expression()
-	if expression == nil {
-		return nil
-	}
-	if ast.IsIdentifier(expression) {
-		if sym := e.checker.GetResolvedSymbol(expression); sym != nil {
-			if target := e.lookupFunction(sym); target != nil {
-				return target
-			}
-		}
-		// Also try GetSymbolAtLocation which may resolve differently.
-		if sym := e.checker.GetSymbolAtLocation(expression); sym != nil {
-			if target := e.lookupFunction(sym); target != nil {
-				return target
-			}
-		}
-	}
-	if ast.IsPropertyAccessExpression(expression) {
-		if target := e.lookupFunction(e.checker.GetResolvedSymbol(expression.Name().AsNode())); target != nil {
-			return target
-		}
-	}
-	if target := e.lookupFunction(e.checker.GetSymbolAtLocation(expression)); target != nil {
-		return target
-	}
-	return nil
+	return callee
 }
 
-func (e *extractor) recordPendingDtsCall(source *Function, node *ast.Node) {
-	signature := e.checker.GetResolvedSignature(node)
-	if signature == nil {
-		return
+// resolveCallTarget returns the collected function that a call resolves to.
+// When it finds none, it returns the declaration of the checker's resolved
+// signature, if there is one. A call links to a function only through the
+// checker's signature or through the callee's own symbol, never through a
+// name lookup, so seen.add() on a Set does not link to a local add.
+func (e *extractor) resolveCallTarget(node *ast.Node) (*Function, *ast.Node) {
+	var declaration *ast.Node
+	if signature := e.checker.GetResolvedSignature(node); signature != nil {
+		declaration = signature.Declaration()
+		if target := e.lookupFunction(declaration); target != nil {
+			return target, nil
+		}
+		if declaration != nil {
+			if target := e.lookupFunction(declaration.Symbol()); target != nil {
+				return target, nil
+			}
+		}
 	}
-	decl := signature.Declaration()
-	if decl == nil {
-		return
+	expression := ast.SkipParentheses(node.Expression())
+	if expression != nil && (ast.IsIdentifier(expression) || ast.IsPropertyAccessExpression(expression)) {
+		if target := e.lookupFunction(e.checker.GetSymbolAtLocation(expression)); target != nil {
+			return target, nil
+		}
 	}
+	return nil, declaration
+}
+
+// recordPendingDtsCall records a call to a declaration in a workspace dist/
+// .d.ts file. resolveDtsCalls later links it to the matching source function.
+func (e *extractor) recordPendingDtsCall(source callSource, decl *ast.Node, location SourceLocation) bool {
 	sf := ast.GetSourceFileOfNode(decl)
 	if sf == nil {
-		return
+		return false
 	}
 	fileName := normalizeSlash(sf.FileName().AsString())
-	if !strings.HasSuffix(fileName, ".d.ts") {
-		return
+	if !strings.HasSuffix(fileName, ".d.ts") || !isWithinRoot(e.workspaceRoot, fileName) || strings.Contains(fileName, "/node_modules/") {
+		return false
 	}
 	name := ""
 	if decl.Symbol() != nil {
 		name = decl.Symbol().Name()
 	}
 	if name == "" {
-		return
+		return false
 	}
 	relPath := e.relativePath(fileName)
 	if !strings.Contains(relPath, "/dist/") {
-		return
+		return false
 	}
-	calleeNode := node.Expression()
-	if ast.IsPropertyAccessExpression(calleeNode) {
-		calleeNode = calleeNode.Name().AsNode()
-	}
-	callFile := ast.GetSourceFileOfNode(node)
-	if callFile == nil {
-		return
-	}
-	location := e.location(callFile, calleeNode.Pos(), calleeNode.End())
 	e.pendingDtsCalls = append(e.pendingDtsCalls, PendingDtsCall{
 		DtsPath:         relPath,
 		TargetName:      name,
-		FromSemanticKey: source.SemanticKey,
-		FromName:        source.Name,
-		FromPath:        source.FilePath,
+		FromSemanticKey: source.key,
+		FromModule:      source.module,
+		FromName:        source.name,
+		FromPath:        source.path,
 		Range:           location,
 	})
+	return true
+}
+
+// recordExternalCall records a call whose declaration is in the default
+// library, in a package, or in a declaration file. Calls to declarations in
+// workspace source files, such as interface members, are not external.
+func (e *extractor) recordExternalCall(source callSource, call *ast.Node, decl *ast.Node, location SourceLocation) {
+	moduleName := e.externalModuleName(decl)
+	name := qualifiedSymbolName(decl.Symbol())
+	if name == "" {
+		callee := e.checker.GetSymbolAtLocation(ast.SkipParentheses(call.Expression()))
+		if callee != nil && callee.Flags()&ast.SymbolFlagsAlias != 0 {
+			callee = e.checker.SkipAlias(callee)
+		}
+		name = qualifiedSymbolName(callee)
+	}
+	if moduleName == "" || name == "" {
+		return
+	}
+	baseKey := fmt.Sprintf("%s::external::%s::%s", source.key, moduleName, name)
+	semanticKey := withOrdinal(baseKey, nextOrdinal(e.externalCount, baseKey))
+	e.externalCalls = append(e.externalCalls, ExternalCall{
+		EntityID:        "external_call:" + semanticKey,
+		SemanticKey:     semanticKey,
+		FromSemanticKey: source.key,
+		FromModule:      source.module,
+		FromPath:        source.path,
+		Module:          moduleName,
+		Name:            name,
+		Range:           location,
+	})
+}
+
+// externalModuleName names the module that declares an external
+// declaration: the name of an enclosing declare module "x" block, "lib" for
+// the default library, the package name for node_modules, or the
+// workspace-relative path of a declaration file. It returns "" for
+// declarations in workspace source files.
+func (e *extractor) externalModuleName(decl *ast.Node) string {
+	for parent := decl.Parent; parent != nil; parent = parent.Parent {
+		if ast.IsModuleDeclaration(parent) && ast.IsStringLiteral(parent.Name()) {
+			return parent.Name().Text()
+		}
+	}
+	file := ast.GetSourceFileOfNode(decl)
+	if file == nil {
+		return ""
+	}
+	if e.program.IsSourceFileDefaultLibrary(file.PathKey()) {
+		return "lib"
+	}
+	fileName := normalizeSlash(file.FileName().AsString())
+	if index := strings.LastIndex(fileName, "/node_modules/"); index >= 0 {
+		packageName := packageNameFromSpecifier(fileName[index+len("/node_modules/"):])
+		if typed, ok := strings.CutPrefix(packageName, "@types/"); ok {
+			if scope, name, scoped := strings.Cut(typed, "__"); scoped {
+				return "@" + scope + "/" + name
+			}
+			return typed
+		}
+		return packageName
+	}
+	if !file.IsDeclarationFile && isWithinRoot(e.workspaceRoot, fileName) {
+		return ""
+	}
+	return e.relativePath(fileName)
+}
+
+// qualifiedSymbolName returns the name of a symbol with the names of its
+// containing classes, interfaces and namespaces, for example "JSON.parse"
+// or "Set.add". It returns "" for a symbol with an internal name, such as a
+// call signature.
+func qualifiedSymbolName(symbol *ast.Symbol) string {
+	if symbol == nil || isInternalSymbolName(symbol.Name()) {
+		return ""
+	}
+	parts := []string{symbol.Name()}
+	for parent := symbol.Parent(); parent != nil; parent = parent.Parent() {
+		name := parent.Name()
+		if name == "" || strings.HasPrefix(name, "\"") || isInternalSymbolName(name) {
+			break
+		}
+		parts = append([]string{name}, parts...)
+	}
+	return strings.Join(parts, ".")
+}
+
+func isInternalSymbolName(name string) bool {
+	return strings.HasPrefix(name, ast.InternalSymbolNamePrefix)
+}
+
+// moduleDirectives returns the directive prologue of a file, for example
+// "use client".
+func (e *extractor) moduleDirectives(file *ast.SourceFile, relative string) []ModuleDirective {
+	result := make([]ModuleDirective, 0)
+	counts := make(map[string]int)
+	for _, statement := range file.Statements.Nodes {
+		if !ast.IsPrologueDirective(statement) {
+			break
+		}
+		expression := statement.Expression()
+		text := expression.Text()
+		baseKey := fmt.Sprintf("%s::directive::%s", relative, text)
+		semanticKey := withOrdinal(baseKey, nextOrdinal(counts, baseKey))
+		result = append(result, ModuleDirective{
+			EntityID:    "directive:" + semanticKey,
+			SemanticKey: semanticKey,
+			FilePath:    relative,
+			Text:        text,
+			Range:       e.nodeLocation(file, expression),
+		})
+	}
+	return result
+}
+
+// moduleParseError returns the first syntax error of a file.
+func (e *extractor) moduleParseError(file *ast.SourceFile, relative string) (ParseError, bool) {
+	diagnostics := file.Diagnostics()
+	if len(diagnostics) == 0 {
+		return ParseError{}, false
+	}
+	first := diagnostics[0]
+	semanticKey := relative + "::parse_error"
+	return ParseError{
+		EntityID:    "parse_error:" + semanticKey,
+		SemanticKey: semanticKey,
+		FilePath:    relative,
+		Message:     first.String(),
+		Range:       e.location(file, first.Pos(), first.End()),
+	}, true
 }
 
 func mapDtsToSource(dtsPath string) string {
@@ -889,7 +1084,7 @@ func (e *extractor) collectTypeRef(nameNode *ast.Node, rangeNode *ast.Node) {
 	if name == "" {
 		return
 	}
-	location := e.location(file, rangeNode.Pos(), rangeNode.End())
+	location := e.nodeLocation(file, rangeNode)
 	baseKey := fmt.Sprintf("%s::type_ref::%s", location.File, name)
 	semanticKey := withOrdinal(baseKey, nextOrdinal(e.typeRefCount, baseKey))
 	e.typeRefs = append(e.typeRefs, TypeRef{
@@ -961,21 +1156,28 @@ func (e *extractor) renderTypeText(t *checker.Type, enclosing *ast.Node) string 
 	)
 }
 
-func extractImportedSymbols(node *ast.Node) ([]ImportedSymbol, bool, bool, bool, bool) {
-	if node == nil || !ast.IsImportDeclaration(node) {
-		return nil, false, false, false, false
+// extractImportedSymbols returns the bindings that an import declaration,
+// a re-export or an import-equals declaration introduces. For a re-export,
+// the names are the names that the target module exports.
+func extractImportedSymbols(node *ast.Node, isTypeOnly bool) ([]ImportedSymbol, bool, bool, bool) {
+	switch {
+	case ast.IsExportDeclaration(node):
+		return extractReexportedSymbols(node, isTypeOnly)
+	case ast.IsImportEqualsDeclaration(node):
+		return []ImportedSymbol{{Name: node.Name().Text(), Kind: "namespace", IsTypeOnly: isTypeOnly}}, false, true, false
+	case !ast.IsImportDeclaration(node):
+		return nil, false, false, false
 	}
 	decl := node.AsImportDeclaration()
 	if decl.ImportClause == nil {
-		return nil, false, false, false, false
+		return nil, false, false, false
 	}
 	clause := decl.ImportClause.AsImportClause()
 	if clause == nil {
-		return nil, false, false, false, false
+		return nil, false, false, false
 	}
 
 	symbols := make([]ImportedSymbol, 0, 4)
-	isTypeOnly := clause.IsTypeOnly()
 	hasDefaultImport := false
 	hasNamespaceImport := false
 	hasNamedImports := false
@@ -989,7 +1191,7 @@ func extractImportedSymbols(node *ast.Node) ([]ImportedSymbol, bool, bool, bool,
 		})
 	}
 	if clause.NamedBindings == nil {
-		return symbols, hasDefaultImport, hasNamespaceImport, hasNamedImports, isTypeOnly
+		return symbols, hasDefaultImport, hasNamespaceImport, hasNamedImports
 	}
 
 	switch clause.NamedBindings.Kind {
@@ -1015,7 +1217,33 @@ func extractImportedSymbols(node *ast.Node) ([]ImportedSymbol, bool, bool, bool,
 			})
 		}
 	}
-	return symbols, hasDefaultImport, hasNamespaceImport, hasNamedImports, isTypeOnly
+	return symbols, hasDefaultImport, hasNamespaceImport, hasNamedImports
+}
+
+func extractReexportedSymbols(node *ast.Node, isTypeOnly bool) ([]ImportedSymbol, bool, bool, bool) {
+	clause := node.AsExportDeclaration().ExportClause
+	if clause == nil {
+		return nil, false, false, false
+	}
+	if clause.Kind == ast.KindNamespaceExport {
+		return []ImportedSymbol{{Name: clause.Name().Text(), Kind: "namespace", IsTypeOnly: isTypeOnly}}, false, true, false
+	}
+	symbols := make([]ImportedSymbol, 0, 4)
+	for _, specifier := range clause.Elements() {
+		if specifier == nil || specifier.Name() == nil {
+			continue
+		}
+		nameNode := specifier.Name()
+		if property := specifier.PropertyName(); property != nil {
+			nameNode = property
+		}
+		symbols = append(symbols, ImportedSymbol{
+			Name:       nameNode.Text(),
+			Kind:       "named",
+			IsTypeOnly: specifier.IsTypeOnly() || isTypeOnly,
+		})
+	}
+	return symbols, false, false, len(symbols) > 0
 }
 
 func (e *extractor) resolveTypeTargetPath(nameNode *ast.Node) string {
@@ -1125,6 +1353,12 @@ func (e *extractor) moduleRange(file *ast.SourceFile) SourceLocation {
 	return e.location(file, 0, len(file.Text()))
 }
 
+// nodeLocation returns the range of a node from its first token, without
+// the leading trivia.
+func (e *extractor) nodeLocation(file *ast.SourceFile, node *ast.Node) SourceLocation {
+	return e.location(file, scanner.GetTokenPosOfNode(node, file, false), node.End())
+}
+
 func (e *extractor) location(file *ast.SourceFile, start int, end int) SourceLocation {
 	relative := e.relativePath(file.FileName().AsString())
 	if start < 0 || end < 0 {
@@ -1191,7 +1425,17 @@ func functionMetaForNode(node *ast.Node) *functionMeta {
 	case ast.IsFunctionDeclaration(node):
 		name := node.Name()
 		if name == nil {
-			return nil
+			if !ast.HasSyntacticModifier(node, ast.ModifierFlagsDefault) {
+				return nil
+			}
+			return &functionMeta{
+				localName:    "default",
+				kind:         "function",
+				nameNode:     node,
+				lookupNodes:  []*ast.Node{node},
+				namingSource: node,
+				exported:     true,
+			}
 		}
 		nameNode := name.AsNode()
 		return &functionMeta{
@@ -1216,10 +1460,27 @@ func functionMetaForNode(node *ast.Node) *functionMeta {
 		}
 		nameNode := name.AsNode()
 		return &functionMeta{
-			localName:    ast.GetTextOfPropertyName(nameNode),
+			localName:    propertyNameText(nameNode),
 			kind:         "method",
 			nameNode:     nameNode,
 			lookupNodes:  []*ast.Node{node, nameNode},
+			namingSource: node,
+		}
+	case ast.IsGetAccessorDeclaration(node), ast.IsSetAccessorDeclaration(node):
+		name := node.Name()
+		if name == nil {
+			return nil
+		}
+		kind := "get_accessor"
+		if ast.IsSetAccessorDeclaration(node) {
+			kind = "set_accessor"
+		}
+		nameNode := name.AsNode()
+		return &functionMeta{
+			localName:    propertyNameText(nameNode),
+			kind:         kind,
+			nameNode:     nameNode,
+			lookupNodes:  []*ast.Node{node},
 			namingSource: node,
 		}
 	case ast.IsFunctionExpression(node):
@@ -1249,11 +1510,31 @@ func expressionFunctionMeta(node *ast.Node, kind string) *functionMeta {
 	if ast.IsPropertyAssignment(parent) && parent.Name() != nil {
 		nameNode := parent.Name().AsNode()
 		return &functionMeta{
-			localName:    ast.GetTextOfPropertyName(nameNode),
+			localName:    propertyNameText(nameNode),
 			kind:         kind,
 			nameNode:     nameNode,
 			namingSource: parent,
 			lookupNodes:  []*ast.Node{node, parent, nameNode},
+		}
+	}
+	if ast.IsPropertyDeclaration(parent) && parent.Initializer() == node && parent.Name() != nil {
+		nameNode := parent.Name().AsNode()
+		return &functionMeta{
+			localName:    propertyNameText(nameNode),
+			kind:         kind,
+			nameNode:     nameNode,
+			namingSource: parent,
+			lookupNodes:  []*ast.Node{node, parent, nameNode},
+		}
+	}
+	if ast.IsExportAssignment(parent) && !parent.AsExportAssignment().IsExportEquals && node.Name() == nil {
+		return &functionMeta{
+			localName:    "default",
+			kind:         kind,
+			nameNode:     node,
+			namingSource: parent,
+			lookupNodes:  []*ast.Node{node, parent},
+			exported:     true,
 		}
 	}
 	name := node.Name()
@@ -1287,7 +1568,7 @@ func containerNameForNode(node *ast.Node, namingSource *ast.Node) string {
 			}
 		case ast.IsMethodDeclaration(parent):
 			if parent.Name() != nil {
-				parts = append([]string{ast.GetTextOfPropertyName(parent.Name().AsNode())}, parts...)
+				parts = append([]string{propertyNameText(parent.Name().AsNode())}, parts...)
 			}
 		case ast.IsConstructorDeclaration(parent):
 			parts = append([]string{"constructor"}, parts...)
@@ -1297,11 +1578,21 @@ func containerNameForNode(node *ast.Node, namingSource *ast.Node) string {
 			}
 		case ast.IsPropertyAssignment(parent):
 			if parent.Name() != nil && parent.Initializer() == child && (ast.IsObjectLiteralExpression(child) || child.Kind == ast.KindClassExpression) {
-				parts = append([]string{ast.GetTextOfPropertyName(parent.Name().AsNode())}, parts...)
+				parts = append([]string{propertyNameText(parent.Name().AsNode())}, parts...)
 			}
 		}
 	}
 	return strings.Join(parts, ".")
+}
+
+// propertyNameText returns the text of a property name. A computed name that
+// is not a literal, such as [Symbol.iterator], gives its source text in
+// brackets.
+func propertyNameText(name *ast.Node) string {
+	if text, ok := ast.TryGetTextOfPropertyName(name); ok {
+		return text
+	}
+	return "[" + scanner.GetTextOfNode(name.Expression()) + "]"
 }
 
 func qualifiedName(node *ast.Node) string {
