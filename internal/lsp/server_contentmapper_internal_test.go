@@ -1,0 +1,170 @@
+package lsp
+
+import (
+	"strings"
+	"testing"
+
+	"github.com/microsoft/TypeScript/tsc/internal/core"
+	"github.com/microsoft/TypeScript/tsc/internal/lsp/lsproto"
+	"github.com/microsoft/TypeScript/tsc/internal/tspath"
+	"gotest.tools/v3/assert"
+)
+
+func TestContentMapperLoggerRequiresTrace(t *testing.T) {
+	t.Parallel()
+	var output strings.Builder
+	server := &Server{stderr: &output}
+	server.logger = newLogger(server)
+	logger := server.contentMapperLogger()
+	logger("hidden")
+	assert.Equal(t, output.String(), "")
+	server.logger.SetVerbosity(lsproto.LogVerbosityTrace)
+	logger("visible")
+	assert.Assert(t, strings.Contains(output.String(), "visible"))
+}
+
+func TestParseContentMapperContributions(t *testing.T) {
+	t.Parallel()
+	version := "2.3.4"
+	cwd := "/workspace/mapper"
+	compilerOptions := []string{"strict"}
+	outputExtensions := map[string]string{".vue": ".js"}
+	options := map[string]any{"mode": "embedded"}
+	contributions, err := parseContentMapperContributions([]*lsproto.ContentMapperContribution{
+		{
+			ContributorId: "publisher.extension",
+			Extensions:    []string{".vue"},
+			InferredProjectContribution: &lsproto.InferredProjectContentMapperContribution{
+				Options: &options,
+				Manifest: &lsproto.ContentMapperManifest{
+					Name:             "Vue mapper",
+					Version:          &version,
+					Exec:             []string{"node", "mapper.js"},
+					Cwd:              &cwd,
+					CompilerOptions:  &compilerOptions,
+					OutputExtensions: &outputExtensions,
+				},
+			},
+		},
+		{
+			ContributorId: "publisher.extension",
+			Extensions:    []string{".svelte"},
+		},
+	})
+	assert.NilError(t, err)
+	assert.Equal(t, len(contributions.Mappers), 1)
+	assert.DeepEqual(t, contributions.Extensions, []string{".vue"})
+	mapper := contributions.Mappers[0]
+	assert.Equal(t, mapper.Identity(), "publisher.extension[0] (Vue mapper@2.3.4)")
+	assert.Equal(t, mapper.PackageDirectory.AsString(), cwd)
+	assert.DeepEqual(t, mapper.Manifest.DefaultOutputExtensions, map[string]string{".vue": ".js"})
+	assert.DeepEqual(t, mapper.Definition.OutputExtensions, map[string]string{".vue": ".js"})
+	outputExtensions[".vue"] = ".mjs"
+	assert.Equal(t, mapper.Definition.OutputExtensions[".vue"], ".js")
+	mapper.Manifest.DefaultOutputExtensions[".vue"] = ".cjs"
+	assert.Equal(t, mapper.Definition.OutputExtensions[".vue"], ".js")
+	assert.Equal(t, string(mapper.Definition.Options), `{"mode":"embedded"}`)
+}
+
+func TestParseContentMapperContributionsRejectsConflictingInlineMappers(t *testing.T) {
+	t.Parallel()
+	inferredProjectContribution := func(name string) *lsproto.InferredProjectContentMapperContribution {
+		return &lsproto.InferredProjectContentMapperContribution{Manifest: &lsproto.ContentMapperManifest{Name: name, Exec: []string{name}}}
+	}
+	_, err := parseContentMapperContributions([]*lsproto.ContentMapperContribution{
+		{ContributorId: "first", Extensions: []string{".vue"}, InferredProjectContribution: inferredProjectContribution("first")},
+		{ContributorId: "second", Extensions: []string{".vue"}, InferredProjectContribution: inferredProjectContribution("second")},
+	})
+	assert.ErrorContains(t, err, `both claim extension ".vue"`)
+}
+
+func TestParseContentMapperContributionsUsesCaseInsensitiveExtensions(t *testing.T) {
+	t.Parallel()
+	inferredProjectContribution := func(name string) *lsproto.InferredProjectContentMapperContribution {
+		return &lsproto.InferredProjectContentMapperContribution{Manifest: &lsproto.ContentMapperManifest{Name: name, Exec: []string{name}}}
+	}
+	_, err := parseContentMapperContributions([]*lsproto.ContentMapperContribution{
+		{ContributorId: "first", Extensions: []string{".vue"}, InferredProjectContribution: inferredProjectContribution("first")},
+		{ContributorId: "second", Extensions: []string{".VUE"}, InferredProjectContribution: inferredProjectContribution("second")},
+	})
+	assert.ErrorContains(t, err, `both claim extension ".VUE"`)
+
+	_, err = parseContentMapperContributions([]*lsproto.ContentMapperContribution{{
+		ContributorId: "built-in",
+		Extensions:    []string{".TS"},
+	}})
+	assert.ErrorContains(t, err, `invalid extension ".TS"`)
+}
+
+func TestParseContentMapperContributionsDefaultsOptionsToObject(t *testing.T) {
+	t.Parallel()
+	contributions, err := parseContentMapperContributions([]*lsproto.ContentMapperContribution{{
+		ContributorId: "publisher.extension",
+		Extensions:    []string{".vue"},
+		InferredProjectContribution: &lsproto.InferredProjectContentMapperContribution{
+			Manifest: &lsproto.ContentMapperManifest{Name: "mapper", Exec: []string{"mapper"}},
+		},
+	}})
+	assert.NilError(t, err)
+	assert.Equal(t, string(contributions.Mappers[0].Definition.Options), `{}`)
+}
+
+func TestParseContentMapperContributionsCompoundExtensions(t *testing.T) {
+	t.Parallel()
+	for _, extension := range []string{".y.z", ".component.tsx.vue"} {
+		contributions, err := parseContentMapperContributions([]*lsproto.ContentMapperContribution{{
+			ContributorId: "mapper",
+			Extensions:    []string{extension},
+			InferredProjectContribution: &lsproto.InferredProjectContentMapperContribution{
+				Manifest: &lsproto.ContentMapperManifest{Name: "mapper", Exec: []string{"mapper"}},
+			},
+		}})
+		assert.NilError(t, err)
+		assert.DeepEqual(t, contributions.Extensions, []string{extension})
+	}
+	for _, nativeExtension := range core.Flatten(tspath.AllSupportedExtensionsWithJson) {
+		for _, extension := range []string{".component" + nativeExtension, ".component" + strings.ToUpper(nativeExtension)} {
+			_, err := parseContentMapperContributions([]*lsproto.ContentMapperContribution{{
+				ContributorId: "mapper", Extensions: []string{extension},
+			}})
+			assert.ErrorContains(t, err, "invalid extension")
+		}
+	}
+}
+
+func TestParseContentMapperContributionsRejectsInvalidOutputExtensions(t *testing.T) {
+	t.Parallel()
+	for _, compilerOptions := range []*[]string{nil, new([]string{}), new([]string{"strict"})} {
+		outputExtensions := map[string]string{".vue": "js"}
+		_, err := parseContentMapperContributions([]*lsproto.ContentMapperContribution{{
+			ContributorId: "publisher.extension",
+			Extensions:    []string{".vue"},
+			InferredProjectContribution: &lsproto.InferredProjectContentMapperContribution{
+				Manifest: &lsproto.ContentMapperManifest{
+					Name: "mapper", Exec: []string{"mapper"},
+					CompilerOptions: compilerOptions, OutputExtensions: &outputExtensions,
+				},
+			},
+		}})
+		assert.ErrorContains(t, err, `invalid output extension mapping`)
+	}
+}
+
+func TestParseContentMapperContributionsRejectsExtensionPaths(t *testing.T) {
+	t.Parallel()
+	for _, extension := range []string{".vue/foo", `.vue\foo`} {
+		_, err := parseContentMapperContributions([]*lsproto.ContentMapperContribution{{
+			ContributorId: "mapper", Extensions: []string{extension},
+		}})
+		assert.ErrorContains(t, err, "invalid extension")
+		for _, outputExtensions := range []map[string]string{{extension: ".js"}, {".vue": extension}} {
+			_, err := parseContentMapperContributions([]*lsproto.ContentMapperContribution{{
+				ContributorId: "mapper", Extensions: []string{".vue"},
+				InferredProjectContribution: &lsproto.InferredProjectContentMapperContribution{
+					Manifest: &lsproto.ContentMapperManifest{Name: "mapper", Exec: []string{"mapper"}, OutputExtensions: &outputExtensions},
+				},
+			}})
+			assert.ErrorContains(t, err, "invalid output extension mapping")
+		}
+	}
+}
