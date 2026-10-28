@@ -33,6 +33,14 @@ type BuildSnapshotRequest struct {
 	WorkspaceRoot   string
 	Files           []string
 	AmbientMatchers []AmbientMatcher
+	// TsconfigFiles limits the modules to the files that tsc compiles. A
+	// file under a tsconfig.json is a module only when the program of that
+	// tsconfig contains it, as a root file or as an imported file. When it
+	// is false, every file in Files is a module, and a file that its
+	// tsconfig does not contain is analyzed with a synthetic tsconfig.
+	// Files with no tsconfig.json are always analyzed with the synthetic
+	// tsconfig.
+	TsconfigFiles bool
 }
 
 type SourceLocation struct {
@@ -167,10 +175,14 @@ type Snapshot struct {
 	Directives      []ModuleDirective
 	ParseErrors     []ParseError
 	PendingDtsCalls []PendingDtsCall
+	// ConfigFiles are the absolute paths of the tsconfig files that the
+	// snapshot read, including extended and referenced configs.
+	ConfigFiles []string
 }
 
 type configGroup struct {
 	ConfigPath   string
+	Config       *tsoptions.ParsedCommandLine
 	PrimaryFiles []string
 }
 
@@ -237,18 +249,29 @@ func BuildSnapshot(ctx context.Context, req BuildSnapshotRequest) (*Snapshot, er
 		return &Snapshot{}, nil
 	}
 
-	groups, err := discoverConfigGroups(workspaceRoot, files)
+	host := compiler.NewCompilerHost(
+		bundled.WrapFS(osvfs.FS()),
+		bundled.LibPath(),
+		nil,
+		nil,
+		nil,
+	)
+	configs := newConfigCache(host)
+	groups, err := discoverConfigGroups(workspaceRoot, files, configs)
 	if err != nil {
 		return nil, err
 	}
 	merged := &Snapshot{}
 	missing := make(map[string]struct{})
 	for _, group := range groups {
-		partial, groupMissing, err := buildSnapshotForGroup(ctx, workspaceRoot, files, group, req.AmbientMatchers)
+		partial, groupMissing, err := buildSnapshotForGroup(ctx, host, workspaceRoot, files, group, req.AmbientMatchers)
 		if err != nil {
 			return nil, err
 		}
 		mergeSnapshot(merged, partial)
+		if req.TsconfigFiles && group.Config != nil {
+			continue
+		}
 		for _, file := range groupMissing {
 			missing[file] = struct{}{}
 		}
@@ -259,15 +282,36 @@ func BuildSnapshot(ctx context.Context, req BuildSnapshotRequest) (*Snapshot, er
 			fallbackFiles = append(fallbackFiles, file)
 		}
 		slices.Sort(fallbackFiles)
-		partial, _, err := buildSnapshotForGroup(ctx, workspaceRoot, files, configGroup{PrimaryFiles: fallbackFiles}, req.AmbientMatchers)
+		partial, _, err := buildSnapshotForGroup(ctx, host, workspaceRoot, files, configGroup{PrimaryFiles: fallbackFiles}, req.AmbientMatchers)
 		if err != nil {
 			return nil, err
 		}
 		mergeSnapshot(merged, partial)
 	}
 	resolveDtsCalls(merged)
+	if req.TsconfigFiles {
+		keepModuleFiles(merged)
+	}
+	merged.ConfigFiles = configs.files()
 	sortSnapshot(merged)
 	return merged, nil
+}
+
+// keepModuleFiles removes the functions in files that are not modules, and
+// the call edges to them. A group can collect the functions of a file that
+// it imports from another group, and that group can leave the file out.
+// Import edges to such a file stay: the import is in the source.
+func keepModuleFiles(snap *Snapshot) {
+	modules := make(map[string]struct{}, len(snap.Modules))
+	for _, item := range snap.Modules {
+		modules[item.Path] = struct{}{}
+	}
+	isModule := func(path string) bool {
+		_, ok := modules[path]
+		return ok
+	}
+	snap.Functions = slices.DeleteFunc(snap.Functions, func(item Function) bool { return !isModule(item.FilePath) })
+	snap.CallEdges = slices.DeleteFunc(snap.CallEdges, func(item CallEdge) bool { return !isModule(item.ToPath) })
 }
 
 // resolveDtsCalls resolves unresolved calls where the target declaration is
@@ -310,17 +354,14 @@ func resolveDtsCalls(snap *Snapshot) {
 	snap.PendingDtsCalls = nil
 }
 
-func buildSnapshotForGroup(ctx context.Context, workspaceRoot string, requestedFiles []string, group configGroup, ambientMatchers []AmbientMatcher) (*Snapshot, []string, error) {
-	host := compiler.NewCompilerHost(
-		bundled.WrapFS(osvfs.FS()),
-		bundled.LibPath(),
-		nil,
-		nil,
-		nil,
-	)
-	config, err := loadConfig(host, workspaceRoot, group.PrimaryFiles, group.ConfigPath)
-	if err != nil {
-		return nil, nil, err
+func buildSnapshotForGroup(ctx context.Context, host compiler.CompilerHost, workspaceRoot string, requestedFiles []string, group configGroup, ambientMatchers []AmbientMatcher) (*Snapshot, []string, error) {
+	config := group.Config
+	if config == nil {
+		synthetic, err := syntheticConfig(host, workspaceRoot, group.PrimaryFiles)
+		if err != nil {
+			return nil, nil, err
+		}
+		config = synthetic
 	}
 	program := compiler.NewProgram(compiler.ProgramOptions{
 		ProgramConfig: compiler.ProgramConfig{Config: config},
@@ -419,15 +460,108 @@ func buildSnapshotForGroup(ctx context.Context, workspaceRoot string, requestedF
 	return partial, missingPrimary, nil
 }
 
-func loadConfig(host compiler.CompilerHost, workspaceRoot string, files []string, configPath string) (*tsoptions.ParsedCommandLine, error) {
-	if configPath != "" {
-		parsed, diags := tsoptions.GetParsedCommandLineOfConfigFile(tspath.RootedFilePathFromAbsolute(configPath), &core.CompilerOptions{}, nil, host.FS(), nil)
-		if len(diags) > 0 {
-			return nil, fmt.Errorf("tsconfig diagnostics: %s", joinDiagnostics(diags))
-		}
+// parsedConfig is a parsed tsconfig file, the set of its root files and the
+// paths of its project references that exist.
+type parsedConfig struct {
+	command    *tsoptions.ParsedCommandLine
+	rootFiles  map[string]struct{}
+	references []string
+}
+
+type configCache struct {
+	host    compiler.CompilerHost
+	configs map[string]*parsedConfig
+	errors  map[string]error
+}
+
+func newConfigCache(host compiler.CompilerHost) *configCache {
+	return &configCache{host: host, configs: make(map[string]*parsedConfig), errors: make(map[string]error)}
+}
+
+func (c *configCache) load(configPath string) (*parsedConfig, error) {
+	if parsed, ok := c.configs[configPath]; ok {
 		return parsed, nil
 	}
+	if err, ok := c.errors[configPath]; ok {
+		return nil, err
+	}
+	command, diags := tsoptions.GetParsedCommandLineOfConfigFile(tspath.RootedFilePathFromAbsolute(configPath), &core.CompilerOptions{}, nil, c.host.FS(), nil)
+	if command != nil {
+		diags = append(diags, command.GetConfigFileParsingDiagnostics()...)
+	}
+	if len(diags) > 0 {
+		err := fmt.Errorf("tsconfig diagnostics: %s", joinDiagnostics(diags))
+		c.errors[configPath] = err
+		return nil, err
+	}
+	rootFiles := make(map[string]struct{}, len(command.FileNames()))
+	for _, fileName := range command.FileNames() {
+		rootFiles[normalizeSlash(fileName.AsString())] = struct{}{}
+	}
+	references := make([]string, 0, len(command.ProjectReferences()))
+	for _, reference := range command.ResolvedProjectReferencePaths() {
+		referencePath := normalizeSlash(reference.AsString())
+		if c.host.FS().FileExists(reference) {
+			references = append(references, referencePath)
+		}
+	}
+	parsed := &parsedConfig{command: command, rootFiles: rootFiles, references: references}
+	c.configs[configPath] = parsed
+	return parsed, nil
+}
 
+// files returns the paths of every loaded config and of the configs that
+// they extend or reference, sorted.
+func (c *configCache) files() []string {
+	result := make([]string, 0, len(c.configs))
+	for configPath, parsed := range c.configs {
+		result = append(result, configPath)
+		for _, extended := range parsed.command.ExtendedSourceFiles() {
+			result = append(result, normalizeSlash(extended.AsString()))
+		}
+		result = append(result, parsed.references...)
+	}
+	slices.Sort(result)
+	return slices.Compact(result)
+}
+
+// owningConfig returns the config that lists file as a root file: the
+// nearest config, or else the first config in its project references, in
+// depth-first order. A solution-style tsconfig.json, with "files": [] and
+// references, lists no files itself. When no config lists the file, it
+// returns the nearest config. A reference to a config that does not exist
+// is skipped.
+func (c *configCache) owningConfig(nearestPath string, file string) (string, error) {
+	visited := make(map[string]struct{})
+	var search func(configPath string) (string, error)
+	search = func(configPath string) (string, error) {
+		if _, seen := visited[configPath]; seen {
+			return "", nil
+		}
+		visited[configPath] = struct{}{}
+		parsed, err := c.load(configPath)
+		if err != nil {
+			return "", err
+		}
+		if _, ok := parsed.rootFiles[file]; ok {
+			return configPath, nil
+		}
+		for _, reference := range parsed.references {
+			owner, err := search(reference)
+			if err != nil || owner != "" {
+				return owner, err
+			}
+		}
+		return "", nil
+	}
+	owner, err := search(nearestPath)
+	if err != nil || owner != "" {
+		return owner, err
+	}
+	return nearestPath, nil
+}
+
+func syntheticConfig(host compiler.CompilerHost, workspaceRoot string, files []string) (*tsoptions.ParsedCommandLine, error) {
 	syntheticPath := filepath.Join(workspaceRoot, "tsconfig.lintai.synthetic.json")
 	relativeFiles := make([]any, 0, len(files))
 	for _, file := range files {
@@ -464,12 +598,18 @@ func loadConfig(host compiler.CompilerHost, workspaceRoot string, files []string
 	return parsed, nil
 }
 
-func discoverConfigGroups(workspaceRoot string, files []string) ([]configGroup, error) {
+func discoverConfigGroups(workspaceRoot string, files []string, configs *configCache) ([]configGroup, error) {
 	grouped := make(map[string][]string)
 	for _, file := range files {
 		configPath, err := findNearestConfigPath(workspaceRoot, file)
 		if err != nil {
 			return nil, err
+		}
+		if configPath != "" {
+			configPath, err = configs.owningConfig(configPath, file)
+			if err != nil {
+				return nil, err
+			}
 		}
 		grouped[configPath] = append(grouped[configPath], file)
 	}
@@ -482,10 +622,11 @@ func discoverConfigGroups(workspaceRoot string, files []string) ([]configGroup, 
 	for _, key := range keys {
 		primaryFiles := grouped[key]
 		slices.Sort(primaryFiles)
-		groups = append(groups, configGroup{
-			ConfigPath:   key,
-			PrimaryFiles: primaryFiles,
-		})
+		group := configGroup{ConfigPath: key, PrimaryFiles: primaryFiles}
+		if key != "" {
+			group.Config = configs.configs[key].command
+		}
+		groups = append(groups, group)
 	}
 	return groups, nil
 }

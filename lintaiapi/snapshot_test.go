@@ -325,6 +325,85 @@ func assertEqualKeys(t *testing.T, left []string, right []string) {
 	}
 }
 
+// With TsconfigFiles, a module is a file that tsc compiles: a root file of
+// its tsconfig or of a referenced tsconfig, or a file that a root file
+// imports. A file with no tsconfig is always a module.
+func TestBuildSnapshotTsconfigFiles(t *testing.T) {
+	root := t.TempDir()
+	files := writeWorkspace(t, root, map[string]string{
+		"app/tsconfig.json": `{
+  "compilerOptions": { "module": "preserve", "moduleResolution": "bundler", "noEmit": true },
+  "include": ["src/**/*.ts"],
+  "exclude": ["src/legacy/**"]
+}
+`,
+		"app/src/main.ts": `import { shared } from "./legacy/shared";
+export function main() { return shared(); }
+`,
+		"app/src/legacy/shared.ts": `export function shared() { return 1; }
+`,
+		"app/src/legacy/old.ts": `export function old() { return 2; }
+`,
+		"app/scripts/build.ts": `export function build() { return 3; }
+`,
+		"lib/tsconfig.json": `{ "files": [], "references": [{ "path": "./tsconfig.src.json" }] }
+`,
+		"lib/tsconfig.src.json": `{
+  "compilerOptions": { "composite": true, "module": "preserve", "moduleResolution": "bundler" },
+  "include": ["src/**/*.ts"]
+}
+`,
+		"lib/src/index.ts": `export function lib() { return 4; }
+`,
+		"tools/run.ts": `export function run() { return 5; }
+`,
+	})
+
+	modulePaths := func(tsconfigFiles bool) []string {
+		t.Helper()
+		snapshot, err := BuildSnapshot(context.Background(), BuildSnapshotRequest{
+			WorkspaceRoot: root,
+			Files:         files,
+			TsconfigFiles: tsconfigFiles,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		paths := make([]string, 0, len(snapshot.Modules))
+		for _, item := range snapshot.Modules {
+			paths = append(paths, item.Path)
+		}
+		for _, item := range snapshot.Functions {
+			if !slices.Contains(paths, item.FilePath) {
+				t.Fatalf("function %s is in %s, which is not a module", item.Name, item.FilePath)
+			}
+		}
+		return paths
+	}
+
+	assertEqualKeys(t, modulePaths(true), []string{
+		"app/src/legacy/shared.ts",
+		"app/src/main.ts",
+		"lib/src/index.ts",
+		"tools/run.ts",
+	})
+	assertEqualKeys(t, modulePaths(false), []string{
+		"app/scripts/build.ts",
+		"app/src/legacy/old.ts",
+		"app/src/legacy/shared.ts",
+		"app/src/main.ts",
+		"lib/src/index.ts",
+		"tools/run.ts",
+	})
+
+	if err := os.WriteFile(filepath.Join(root, "lib/tsconfig.src.json"), []byte(`{ "include": [`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := BuildSnapshot(context.Background(), BuildSnapshotRequest{WorkspaceRoot: root, Files: files, TsconfigFiles: true}); err == nil {
+		t.Fatal("expected an error for a referenced tsconfig that does not parse")
+	}
+}
+
 func moduleKeys(snapshot *Snapshot) []string {
 	keys := make([]string, 0, len(snapshot.Modules))
 	for _, item := range snapshot.Modules {
