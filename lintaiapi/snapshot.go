@@ -359,8 +359,8 @@ func loadConfig(host compiler.CompilerHost, workspaceRoot string, files []string
 			"noEmit":           true,
 			"jsx":              "preserve",
 			"target":           "es2022",
-			"module":           "nodenext",
-			"moduleResolution": "nodenext",
+			"module":           "preserve",
+			"moduleResolution": "bundler",
 		},
 	}
 	parsed := tsoptions.ParseJsonConfigFileContent(
