@@ -229,3 +229,57 @@ func TestDirectivesAndParseErrors(t *testing.T) {
 		t.Fatalf("expected one parse error in src/broken.ts, got %+v", snapshot.ParseErrors)
 	}
 }
+
+// A global reference is a use of a name that resolves to the global binding.
+// A local binding with the same name is not one.
+func TestGlobalRefs(t *testing.T) {
+	snapshot := buildTestSnapshot(t, map[string]string{
+		"src/a.ts": `export function a() {
+	const c = crypto;
+	const w = globalThis.fetch;
+	return [c, w, { Date }];
+}
+export function b(crypto: number) {
+	const Date = 1;
+	return crypto + Date;
+}
+`,
+	})
+	got := make([]string, 0)
+	for _, ref := range snapshot.GlobalRefs {
+		fn := ref.FunctionSemanticKey[strings.LastIndex(ref.FunctionSemanticKey, "::")+2:]
+		got = append(got, fmt.Sprintf("%s %s:%d", ref.Name, fn, ref.Range.StartLine))
+	}
+	slices.Sort(got)
+	want := []string{"Date a:4", "crypto a:2", "fetch a:3", "globalThis a:3"}
+	if !slices.Equal(got, want) {
+		t.Fatalf("got %q, want %q", got, want)
+	}
+}
+
+// With verbatimModuleSyntax, import { type X } from "m" is emitted as
+// import {} from "m", so the module loads at runtime. Without the option,
+// tsc removes the import.
+func TestRetainedTypeImports(t *testing.T) {
+	for _, verbatim := range []bool{true, false} {
+		config := strings.Replace(strictConfig, `"strict": true,`, fmt.Sprintf(`"strict": true, "verbatimModuleSyntax": %t,`, verbatim), 1)
+		snapshot := buildTestSnapshot(t, map[string]string{
+			"tsconfig.json": config,
+			"src/m.ts":      "export type X = number;\nexport const y = 1;\n",
+			"src/a.ts":      "import { type X } from \"./m\";\nimport type { X as Z } from \"./m\";\nimport { type X as W, y } from \"./m\";\nexport const v: X | Z | W = y;\n",
+			"src/b.ts":      "export { type X } from \"./m\";\nexport type { X as Z } from \"./m\";\n",
+		})
+		retained := 0
+		for _, edge := range snapshot.ImportEdges {
+			if edge.Retained {
+				retained++
+				if edge.Range.StartLine != 1 {
+					t.Fatalf("verbatim=%t: unexpected retained import %+v", verbatim, edge)
+				}
+			}
+		}
+		if want := map[bool]int{true: 2, false: 0}[verbatim]; retained != want {
+			t.Fatalf("verbatim=%t: got %d retained imports, want %d", verbatim, retained, want)
+		}
+	}
+}

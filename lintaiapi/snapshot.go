@@ -97,7 +97,13 @@ type ImportEdge struct {
 	HasNamespaceImport bool
 	HasNamedImports    bool
 	IsTypeOnly         bool
-	Range              SourceLocation
+	// Retained is set on an import or re-export declaration that is not
+	// type-only and whose bindings are all type-only, as in
+	// import { type X } from "m" or export { type X } from "m", when
+	// verbatimModuleSyntax is on. tsc then emits import {} from "m" or
+	// export {} from "m", so the module still loads at runtime.
+	Retained bool
+	Range    SourceLocation
 }
 
 // CallEdge is a call from a collected function, or from module scope when
@@ -172,6 +178,7 @@ type Snapshot struct {
 	ExternalCalls   []ExternalCall
 	TypeRefs        []TypeRef
 	AmbientUses     []AmbientUse
+	GlobalRefs      []GlobalRef
 	Directives      []ModuleDirective
 	ParseErrors     []ParseError
 	PendingDtsCalls []PendingDtsCall
@@ -203,15 +210,20 @@ type extractor struct {
 	externalCount   map[string]int
 	typeRefCount    map[string]int
 	ambientCount    map[string]int
+	globalRefCount  map[string]int
 	functions       []Function
 	imports         []ImportEdge
 	calls           []CallEdge
 	externalCalls   []ExternalCall
 	typeRefs        []TypeRef
 	ambientUses     []AmbientUse
+	globalRefs      []GlobalRef
 	pendingDtsCalls []PendingDtsCall
 	ambient         *ambientIndex
 	ambientFile     *ambientFileState
+	ambientMembers  map[*ast.Symbol][]*AmbientMatcher
+	ambientDone     map[*ast.Node]struct{}
+	globalSyms      map[string]*ast.Symbol
 	debugCalls      bool
 }
 
@@ -390,6 +402,9 @@ func buildSnapshotForGroup(ctx context.Context, host compiler.CompilerHost, work
 		externalCount:  make(map[string]int),
 		typeRefCount:   make(map[string]int),
 		ambientCount:   make(map[string]int),
+		globalRefCount: make(map[string]int),
+		ambientDone:    make(map[*ast.Node]struct{}),
+		globalSyms:     make(map[string]*ast.Symbol),
 		ambient:        newAmbientIndex(ambientMatchers),
 		debugCalls:     os.Getenv("LINTAI_DEBUG_CALLS") == "1",
 	}
@@ -452,6 +467,7 @@ func buildSnapshotForGroup(ctx context.Context, host compiler.CompilerHost, work
 		ExternalCalls:   ex.externalCalls,
 		TypeRefs:        ex.typeRefs,
 		AmbientUses:     ex.ambientUses,
+		GlobalRefs:      ex.globalRefs,
 		Directives:      directives,
 		ParseErrors:     parseErrors,
 		PendingDtsCalls: ex.pendingDtsCalls,
@@ -667,6 +683,7 @@ func mergeSnapshot(into *Snapshot, partial *Snapshot) {
 	into.ExternalCalls = mergeByEntityID(into.ExternalCalls, partial.ExternalCalls, func(item ExternalCall) string { return item.EntityID })
 	into.TypeRefs = mergeByEntityID(into.TypeRefs, partial.TypeRefs, func(item TypeRef) string { return item.EntityID })
 	into.AmbientUses = mergeByEntityID(into.AmbientUses, partial.AmbientUses, func(item AmbientUse) string { return item.EntityID })
+	into.GlobalRefs = mergeByEntityID(into.GlobalRefs, partial.GlobalRefs, func(item GlobalRef) string { return item.EntityID })
 	into.Directives = mergeByEntityID(into.Directives, partial.Directives, func(item ModuleDirective) string { return item.EntityID })
 	into.ParseErrors = mergeByEntityID(into.ParseErrors, partial.ParseErrors, func(item ParseError) string { return item.EntityID })
 	into.PendingDtsCalls = append(into.PendingDtsCalls, partial.PendingDtsCalls...)
@@ -680,6 +697,7 @@ func sortSnapshot(snapshot *Snapshot) {
 	slices.SortFunc(snapshot.ExternalCalls, func(a, b ExternalCall) int { return strings.Compare(a.SemanticKey, b.SemanticKey) })
 	slices.SortFunc(snapshot.TypeRefs, func(a, b TypeRef) int { return strings.Compare(a.SemanticKey, b.SemanticKey) })
 	slices.SortFunc(snapshot.AmbientUses, func(a, b AmbientUse) int { return strings.Compare(a.SemanticKey, b.SemanticKey) })
+	slices.SortFunc(snapshot.GlobalRefs, func(a, b GlobalRef) int { return strings.Compare(a.SemanticKey, b.SemanticKey) })
 	slices.SortFunc(snapshot.Directives, func(a, b ModuleDirective) int { return strings.Compare(a.SemanticKey, b.SemanticKey) })
 	slices.SortFunc(snapshot.ParseErrors, func(a, b ParseError) int { return strings.Compare(a.SemanticKey, b.SemanticKey) })
 }
@@ -742,6 +760,13 @@ func (e *extractor) walkFacts(node *ast.Node, currentFunction *functionState) {
 	case ast.IsIdentifier(node):
 		if e.ambientFile != nil {
 			e.matchAmbient(node, currentFunction)
+			e.matchGlobalRef(node, currentFunction)
+		}
+	}
+	if e.ambientFile != nil {
+		switch node.Kind {
+		case ast.KindPropertyAccessExpression, ast.KindElementAccessExpression, ast.KindBindingElement, ast.KindShorthandPropertyAssignment, ast.KindPropertyAssignment:
+			e.matchAmbientMember(node, currentFunction)
 		}
 	}
 
@@ -876,8 +901,26 @@ func (e *extractor) collectImport(node *ast.Node, moduleSpecifier *ast.Node, for
 		HasNamespaceImport: hasNamespaceImport,
 		HasNamedImports:    hasNamedImports,
 		IsTypeOnly:         typeOnly,
+		Retained:           e.isRetainedTypeImport(node, typeOnly, importedSymbols),
 		Range:              location,
 	})
+}
+
+// isRetainedTypeImport reports an import or re-export declaration that tsc
+// keeps in the output although every binding is type-only. With
+// verbatimModuleSyntax, import { type X } from "m" becomes import {} from "m",
+// and export { type X } from "m" becomes export {} from "m". A default or
+// namespace binding is a value binding, so it does not need the flag.
+func (e *extractor) isRetainedTypeImport(node *ast.Node, typeOnly bool, symbols []ImportedSymbol) bool {
+	if typeOnly || !(ast.IsImportDeclaration(node) || ast.IsExportDeclaration(node)) || len(symbols) == 0 || !e.program.Options().VerbatimModuleSyntax.IsTrue() {
+		return false
+	}
+	for _, symbol := range symbols {
+		if !symbol.IsTypeOnly {
+			return false
+		}
+	}
+	return true
 }
 
 // resolveModuleSpecifier returns the program's resolution of a specifier. The

@@ -46,9 +46,23 @@ type AmbientUse struct {
 }
 
 type ambientIndex struct {
-	matchers   []*AmbientMatcher
-	roots      map[string]struct{}
-	specifiers map[string]struct{}
+	matchers    []*AmbientMatcher
+	roots       map[string]struct{}
+	specifiers  map[string]struct{}
+	memberNames map[string]struct{}
+}
+
+// GlobalRef is a reference to a global value that the environment declares:
+// a binding from the default library, from @types packages or from a
+// workspace declaration file. Local bindings with the same name are not
+// global references.
+type GlobalRef struct {
+	EntityID            string
+	SemanticKey         string
+	Name                string
+	FilePath            string
+	FunctionSemanticKey string
+	Range               SourceLocation
 }
 
 type ambientFileState struct {
@@ -70,15 +84,22 @@ func newAmbientIndex(matchers []AmbientMatcher) *ambientIndex {
 		return nil
 	}
 	index := &ambientIndex{
-		roots:      make(map[string]struct{}),
-		specifiers: make(map[string]struct{}),
+		roots:       make(map[string]struct{}),
+		specifiers:  make(map[string]struct{}),
+		memberNames: make(map[string]struct{}),
 	}
 	for i := range matchers {
 		matcher := &matchers[i]
 		index.matchers = append(index.matchers, matcher)
 		index.roots[matcher.Root] = struct{}{}
+		if len(matcher.Path) > 0 {
+			index.memberNames[matcher.Path[len(matcher.Path)-1]] = struct{}{}
+		}
 		for _, binding := range matcher.Modules {
 			index.specifiers[binding.Specifier] = struct{}{}
+			if binding.Export != "default" && binding.Export != "*" {
+				index.memberNames[binding.Export] = struct{}{}
+			}
 		}
 	}
 	slices.SortStableFunc(index.matchers, func(a, b *AmbientMatcher) int {
@@ -89,13 +110,17 @@ func newAmbientIndex(matchers []AmbientMatcher) *ambientIndex {
 
 func (e *extractor) beginAmbientFile(file *ast.SourceFile) {
 	e.ambientFile = nil
-	if e.ambient == nil || file.IsDeclarationFile {
+	if file.IsDeclarationFile {
 		return
 	}
 	state := &ambientFileState{
 		file:          file,
 		relative:      e.relativePath(normalizeSlash(file.FileName().AsString())),
 		importedNames: make(map[string]struct{}),
+	}
+	e.ambientFile = state
+	if e.ambient == nil {
+		return
 	}
 	for _, statement := range file.Statements.Nodes {
 		if !ast.IsImportDeclaration(statement) {
@@ -132,12 +157,11 @@ func (e *extractor) beginAmbientFile(file *ast.SourceFile) {
 			}
 		}
 	}
-	e.ambientFile = state
 }
 
 func (e *extractor) matchAmbient(node *ast.Node, currentFunction *functionState) {
 	state := e.ambientFile
-	if state == nil || !ast.IsIdentifier(node) || !isAmbientCandidatePosition(node) {
+	if state == nil || e.ambient == nil || !ast.IsIdentifier(node) || !isAmbientCandidatePosition(node) {
 		return
 	}
 	text := node.Text()
@@ -165,8 +189,253 @@ func (e *extractor) matchAmbient(node *ast.Node, currentFunction *functionState)
 		if !ok || !ambientFormMatches(full, matcher) {
 			continue
 		}
+		if _, done := e.ambientDone[full]; done {
+			return
+		}
 		e.recordAmbient(state, matcher, full, currentFunction)
 		return
+	}
+}
+
+// matchAmbientMember matches a member access, a destructured property or a
+// destructuring-assignment property by the symbol that the checker resolves
+// for it. This finds uses through aliases, for example const p = process;
+// p.env.X, const D = Date; D.now() and const { now } = Date.
+func (e *extractor) matchAmbientMember(node *ast.Node, currentFunction *functionState) {
+	state := e.ambientFile
+	if state == nil || e.ambient == nil {
+		return
+	}
+	var symbol *ast.Symbol
+	switch {
+	case ast.IsPropertyAccessExpression(node):
+		if !e.ambient.hasMemberName(node.Name().Text()) {
+			return
+		}
+		symbol = e.checker.GetSymbolAtLocation(node.Name())
+	case ast.IsElementAccessExpression(node):
+		argument := ast.SkipParentheses(node.AsElementAccessExpression().ArgumentExpression)
+		if argument == nil || !ast.IsStringLiteralLike(argument) || !e.ambient.hasMemberName(argument.Text()) {
+			return
+		}
+		symbol = e.checker.GetSymbolAtLocation(argument)
+	case ast.IsBindingElement(node):
+		pattern := node.Parent
+		if pattern == nil || !ast.IsObjectBindingPattern(pattern) || node.AsBindingElement().DotDotDotToken != nil {
+			return
+		}
+		nameNode := node.PropertyName()
+		if nameNode == nil {
+			nameNode = node.Name()
+		}
+		name := propertyNameText(nameNode)
+		if name == "" || !e.ambient.hasMemberName(name) {
+			return
+		}
+		patternType := e.checker.GetTypeAtLocation(pattern)
+		if patternType == nil {
+			return
+		}
+		symbol = e.checker.GetPropertyOfType(patternType, name)
+	case ast.IsShorthandPropertyAssignment(node), ast.IsPropertyAssignment(node):
+		literal := node.Parent
+		nameNode := node.Name()
+		if literal == nil || nameNode == nil || !ast.IsIdentifier(nameNode) || !e.ambient.hasMemberName(nameNode.Text()) || !ast.IsArrayLiteralOrObjectLiteralDestructuringPattern(literal) {
+			return
+		}
+		symbol = e.checker.GetPropertySymbolOfDestructuringAssignment(nameNode)
+	default:
+		return
+	}
+	if symbol == nil {
+		return
+	}
+	if _, done := e.ambientDone[node]; done {
+		return
+	}
+	for _, matcher := range e.ambientMemberMatchers()[e.skipAlias(symbol)] {
+		if !ambientFormMatches(node, matcher) {
+			continue
+		}
+		e.recordAmbient(state, matcher, node, currentFunction)
+		return
+	}
+}
+
+// ambientMemberMatchers maps the symbol of the last member of each matcher
+// path to the matchers, for example the symbol of Process.env to the env
+// matcher. The checker resolves the symbols once, from the global root and
+// from each module binding of the matcher. The root symbol itself is not in
+// the map: matchAmbient matches identifiers that refer to the root.
+func (e *extractor) ambientMemberMatchers() map[*ast.Symbol][]*AmbientMatcher {
+	if e.ambientMembers != nil {
+		return e.ambientMembers
+	}
+	e.ambientMembers = make(map[*ast.Symbol][]*AmbientMatcher)
+	add := func(symbol *ast.Symbol, matcher *AmbientMatcher) {
+		if symbol == nil {
+			return
+		}
+		symbol = e.skipAlias(symbol)
+		if !slices.Contains(e.ambientMembers[symbol], matcher) {
+			e.ambientMembers[symbol] = append(e.ambientMembers[symbol], matcher)
+		}
+	}
+	for _, matcher := range e.ambient.matchers {
+		if len(matcher.Path) > 0 {
+			add(e.walkMemberPath(e.globalSymbol(matcher.Root), matcher.Path), matcher)
+		}
+		for _, binding := range matcher.Modules {
+			if len(binding.Path) > len(matcher.Path) || !slices.Equal(binding.Path, matcher.Path[:len(binding.Path)]) {
+				continue
+			}
+			start := e.moduleExportSymbol(binding.Specifier, binding.Export)
+			rest := matcher.Path[len(binding.Path):]
+			if len(rest) == 0 && (binding.Export == "default" || binding.Export == "*") {
+				continue
+			}
+			add(e.walkMemberPath(start, rest), matcher)
+		}
+	}
+	return e.ambientMembers
+}
+
+func (index *ambientIndex) hasMemberName(name string) bool {
+	_, ok := index.memberNames[name]
+	return ok
+}
+
+func (e *extractor) walkMemberPath(symbol *ast.Symbol, path []string) *ast.Symbol {
+	for _, step := range path {
+		if symbol == nil {
+			return nil
+		}
+		symbolType := e.checker.GetTypeOfSymbol(e.skipAlias(symbol))
+		if symbolType == nil {
+			return nil
+		}
+		symbol = e.checker.GetPropertyOfType(symbolType, step)
+	}
+	return symbol
+}
+
+// moduleExportSymbol returns the symbol of an export of a declared module,
+// for example randomUUID of "node:crypto". "*" is the module itself. "default"
+// is the default export, the value of export =, or the module itself when it
+// has neither, as with an esModuleInterop default import.
+func (e *extractor) moduleExportSymbol(specifier string, export string) *ast.Symbol {
+	moduleSymbol := e.checker.TryFindAmbientModule(specifier)
+	if moduleSymbol == nil {
+		return nil
+	}
+	resolved := e.checker.ResolveExternalModuleSymbol(moduleSymbol)
+	if resolved == nil {
+		resolved = moduleSymbol
+	}
+	if export == "*" {
+		return resolved
+	}
+	if symbol := e.checker.TryGetMemberInModuleExports(export, moduleSymbol); symbol != nil {
+		return symbol
+	}
+	if export == "default" {
+		return resolved
+	}
+	return nil
+}
+
+func (e *extractor) skipAlias(symbol *ast.Symbol) *ast.Symbol {
+	if symbol != nil && symbol.Flags()&ast.SymbolFlagsAlias != 0 {
+		return e.checker.SkipAlias(symbol)
+	}
+	return symbol
+}
+
+// globalSymbol returns the global value symbol with the name, or nil.
+func (e *extractor) globalSymbol(name string) *ast.Symbol {
+	if symbol, ok := e.globalSyms[name]; ok {
+		return symbol
+	}
+	symbol := e.checker.GetGlobalSymbol(name, ast.SymbolFlagsValue, nil)
+	if symbol != nil {
+		symbol = e.checker.GetMergedSymbol(symbol)
+		if !isGlobalSymbol(symbol) {
+			symbol = nil
+		}
+	}
+	e.globalSyms[name] = symbol
+	return symbol
+}
+
+var globalObjectNames = map[string]struct{}{"globalThis": {}, "window": {}, "self": {}, "global": {}}
+
+// matchGlobalRef records a reference to a global value: an identifier that
+// resolves to the global binding with its name, or a member of a global
+// object, as in globalThis.crypto or window.fetch.
+func (e *extractor) matchGlobalRef(node *ast.Node, currentFunction *functionState) {
+	state := e.ambientFile
+	if state == nil || !ast.IsIdentifier(node) || node.Parent == nil {
+		return
+	}
+	name := node.Text()
+	if name == "undefined" {
+		return
+	}
+	global := e.globalSymbol(name)
+	if global == nil {
+		return
+	}
+	parent := node.Parent
+	switch {
+	case ast.IsPropertyAccessExpression(parent) && parent.Name() == node:
+		object := ast.SkipParentheses(parent.Expression())
+		if !ast.IsIdentifier(object) {
+			return
+		}
+		if _, ok := globalObjectNames[object.Text()]; !ok {
+			return
+		}
+		objectGlobal := e.globalSymbol(object.Text())
+		if objectGlobal == nil || e.checker.GetMergedSymbol(e.checker.GetSymbolAtLocation(object)) != objectGlobal {
+			return
+		}
+	case ast.IsShorthandPropertyAssignment(parent) && parent.Name() == node:
+		if e.checker.GetMergedSymbol(e.checker.GetShorthandAssignmentValueSymbol(parent)) != global {
+			return
+		}
+	default:
+		if !isAmbientCandidatePosition(node) || e.checker.GetMergedSymbol(e.checker.GetSymbolAtLocation(node)) != global {
+			return
+		}
+	}
+	functionKey := ""
+	if currentFunction != nil {
+		functionKey = currentFunction.record.SemanticKey
+	}
+	baseKey := fmt.Sprintf("%s::global::%s", state.relative, name)
+	semanticKey := withOrdinal(baseKey, nextOrdinal(e.globalRefCount, baseKey))
+	start := scanner.GetTokenPosOfNode(node, state.file, false)
+	e.globalRefs = append(e.globalRefs, GlobalRef{
+		EntityID:            "global:" + semanticKey,
+		SemanticKey:         semanticKey,
+		Name:                name,
+		FilePath:            state.relative,
+		FunctionSemanticKey: functionKey,
+		Range:               e.location(state.file, start, node.End()),
+	})
+}
+
+// markAmbientDone marks the matched node and the member chain inside it, so
+// that a shorter matcher does not record a second site for the same use.
+func (e *extractor) markAmbientDone(full *ast.Node) {
+	for node := full; node != nil; {
+		e.ambientDone[node] = struct{}{}
+		switch node.Kind {
+		case ast.KindPropertyAccessExpression, ast.KindElementAccessExpression, ast.KindParenthesizedExpression, ast.KindNonNullExpression:
+			node = node.Expression()
+		default:
+			node = nil
+		}
 	}
 }
 
@@ -206,6 +475,7 @@ func ambientStart(node *ast.Node, text string, symbol *ast.Symbol, global bool, 
 }
 
 func (e *extractor) recordAmbient(state *ambientFileState, matcher *AmbientMatcher, full *ast.Node, currentFunction *functionState) {
+	e.markAmbientDone(full)
 	var sites []ambientSite
 	if matcher.KeyMember {
 		sites = ambientKeySites(full)
